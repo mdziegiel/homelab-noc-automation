@@ -1,0 +1,126 @@
+<!-- Optional: enforce an exact 5-failures-then-block composite rule. -->
+<!-- Append to /var/ossec/etc/rules/local_rules.xml on the MANAGER.   -->
+<!-- If you use THIS, point the <active-response> rules_id at 100100  -->
+<!-- instead of the stock 5712,5720,5763.                             -->
+
+<group name="local,authentication_failures,bruteforce,">
+
+  <rule id="100100" level="10" frequency="5" timeframe="120">
+    <if_matched_sid>5710</if_matched_sid>   <!-- sshd: failed login attempt -->
+    <same_source_ip />
+    <description>Brute force: 5+ failed logins from same source IP in 120s.</description>
+    <group>authentication_failures,pci_dss_11.4,</group>
+  </rule>
+
+</group>
+
+<!-- ============================================================ -->
+<!-- Homelab custom Sysmon detections — low-noise, suspicious only -->
+<!-- Chains off stock base SIDs (level 0):                          -->
+<!--   E3 network=61605  E7 imageload=61609                         -->
+<!--   E12 reg add/del=61614  E13 reg setvalue=61615  E14 rename=61616 -->
+<!-- Append to /var/ossec/etc/rules/local_rules.xml on the MANAGER. -->
+<!-- ============================================================ -->
+
+<group name="local,sysmon,windows,">
+
+  <!-- ===================== E3: NETWORK ===================== -->
+
+  <!-- LOLBins / living-off-the-land binaries making ANY network
+       connection. These almost never have a legit reason to talk
+       to the network; when they do it's usually download-cradle /
+       C2. High signal, low volume. -->
+  <rule id="100300" level="10">
+    <if_sid>61605</if_sid>
+    <field name="win.eventdata.image" type="pcre2">(?i)\\(rundll32|regsvr32|mshta|certutil|bitsadmin|wscript|cscript|installutil|msbuild|hh|cmstp)\.exe$</field>
+    <description>Sysmon E3: LOLBin $(win.eventdata.image) made a network connection to $(win.eventdata.destinationIp):$(win.eventdata.destinationPort) — possible download cradle / C2.</description>
+    <mitre>
+      <id>T1105</id>
+    </mitre>
+    <group>sysmon_event3,lolbin,attack,</group>
+  </rule>
+
+  <!-- Binaries executing from user-writable temp/appdata locations
+       AND reaching the network. Legit software runs from Program
+       Files; malware stages in %TEMP% / %APPDATA%. -->
+  <rule id="100301" level="9">
+    <if_sid>61605</if_sid>
+    <field name="win.eventdata.image" type="pcre2">(?i)\\(Users\\[^\\]+\\(AppData|Downloads)|Windows\\Temp|ProgramData)\\.+\.exe$</field>
+    <field name="win.eventdata.destinationIsIpv6">^false$</field>
+    <description>Sysmon E3: process from a user-writable path ($(win.eventdata.image)) opened a network connection to $(win.eventdata.destinationIp) — staged-binary beaconing pattern.</description>
+    <mitre>
+      <id>T1071</id>
+    </mitre>
+    <group>sysmon_event3,suspicious_path,attack,</group>
+  </rule>
+
+  <!-- ===================== E7: IMAGE LOAD ===================== -->
+
+  <!-- DLL loaded from a user-writable path by a process — classic
+       DLL side-loading / search-order hijack. Excludes the noisy
+       legit installers that drop DLLs in temp during setup. -->
+  <rule id="100310" level="9">
+    <if_sid>61609</if_sid>
+    <field name="win.eventdata.imageLoaded" type="pcre2">(?i)\\(Users\\[^\\]+\\(AppData|Downloads)|Windows\\Temp|ProgramData)\\.+\.dll$</field>
+    <field name="win.eventdata.image" type="pcre2" negate="yes">(?i)\\(msiexec|setup|install|update|teams|onedrive|chrome|firefox|msedge|code)\w*\.exe$</field>
+    <description>Sysmon E7: DLL $(win.eventdata.imageLoaded) loaded from a user-writable path by $(win.eventdata.image) — possible DLL side-loading.</description>
+    <mitre>
+      <id>T1574.002</id>
+    </mitre>
+    <group>sysmon_event7,dll_sideload,attack,</group>
+  </rule>
+
+  <!-- Known credential-access / injection DLLs loaded by a process
+       that is NOT the expected owner. High-value, low-noise. -->
+  <rule id="100311" level="11">
+    <if_sid>61609</if_sid>
+    <field name="win.eventdata.imageLoaded" type="pcre2">(?i)\\(samlib|vaultcli|wlanapi|dsparse|cryptdll|winscard)\.dll$</field>
+    <field name="win.eventdata.image" type="pcre2">(?i)\\(Users\\[^\\]+\\(AppData|Downloads)|Windows\\Temp|ProgramData)\\.+\.exe$</field>
+    <description>Sysmon E7: credential-access DLL $(win.eventdata.imageLoaded) loaded by suspicious binary $(win.eventdata.image) — possible credential theft.</description>
+    <mitre>
+      <id>T1003</id>
+    </mitre>
+    <group>sysmon_event7,credential_access,attack,</group>
+  </rule>
+
+  <!-- ===================== E12/E13/E14: REGISTRY PERSISTENCE ===================== -->
+
+  <!-- Autostart Extensibility Points (ASEP): Run/RunOnce keys.
+       Stock 92300 covers HKLM Run at level 0; this elevates ANY
+       Run/RunOnce write (HKLM or HKCU) to an alert. Persistence. -->
+  <rule id="100320" level="8">
+    <if_sid>61614,61615</if_sid>
+    <field name="win.eventdata.targetObject" type="pcre2">(?i)\\(CurrentVersion\\(Run|RunOnce|RunServices|RunServicesOnce)|Explorer\\Run)\\</field>
+    <description>Sysmon E12/13: registry Run-key persistence written — $(win.eventdata.targetObject) by $(win.eventdata.image).</description>
+    <mitre>
+      <id>T1547.001</id>
+    </mitre>
+    <group>sysmon_event_registry,persistence,attack,</group>
+  </rule>
+
+  <!-- Winlogon / Image File Execution Options / AppInit_DLLs /
+       service ImagePath hijacks — high-confidence persistence and
+       privilege-escalation ASEPs that are rarely touched legitimately. -->
+  <rule id="100321" level="11">
+    <if_sid>61614,61615</if_sid>
+    <field name="win.eventdata.targetObject" type="pcre2">(?i)\\(Winlogon\\(Shell|Userinit|Notify)|Image File Execution Options\\.+\\Debugger|Windows\\AppInit_DLLs|Control\\Lsa\\.+|Services\\.+\\ImagePath)</field>
+    <description>Sysmon E12/13: high-risk ASEP / hijack registry write — $(win.eventdata.targetObject) by $(win.eventdata.image) — strong persistence/privesc indicator.</description>
+    <mitre>
+      <id>T1546.008</id>
+    </mitre>
+    <group>sysmon_event_registry,persistence,privilege_escalation,attack,</group>
+  </rule>
+
+  <!-- Registry key/value RENAME (E14) targeting security tooling or
+       ASEPs — used to disable defenses or hide persistence. -->
+  <rule id="100322" level="10">
+    <if_sid>61616</if_sid>
+    <field name="win.eventdata.targetObject" type="pcre2">(?i)\\(Windows Defender|Policies\\Microsoft\\Windows Defender|CurrentVersion\\Run|Services\\(WinDefend|Sense|WdNisSvc))</field>
+    <description>Sysmon E14: registry rename touching security tooling / ASEP — $(win.eventdata.targetObject) by $(win.eventdata.image) — possible defense evasion.</description>
+    <mitre>
+      <id>T1562.001</id>
+    </mitre>
+    <group>sysmon_event_registry,defense_evasion,attack,</group>
+  </rule>
+
+</group>

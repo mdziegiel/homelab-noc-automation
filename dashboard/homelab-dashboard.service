@@ -1,0 +1,18 @@
+[Unit]
+Description=Homelab NOC Dashboard generator (regenerates static index.html)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=admin
+Group=admin
+# Adjust paths to your environment. The generator reads ~/.hermes/.env and
+# writes the static dashboard to ~/homelab-dashboard/index.html
+ExecStart=/usr/bin/python3 %h/.hermes/scripts/generate_dashboard.py
+# Harden a little
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

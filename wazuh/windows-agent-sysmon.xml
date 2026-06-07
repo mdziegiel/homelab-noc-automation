@@ -1,0 +1,11 @@
+<!-- ============================================================ -->
+<!-- WINDOWS AGENT ossec.conf additions                            -->
+<!-- File on each Windows host: C:\Program Files (x86)\ossec-agent\ossec.conf -->
+<!-- Insert inside <ossec_config> ... </ossec_config>              -->
+<!-- Collects the Sysmon operational channel.                      -->
+<!-- ============================================================ -->
+
+<localfile>
+  <location>Microsoft-Windows-Sysmon/Operational</location>
+  <log_format>eventchannel</log_format>
+</localfile>

@@ -1,0 +1,39 @@
+<!-- ========================================================= -->
+<!-- MANAGER ossec.conf additions  (/var/ossec/etc/ossec.conf) -->
+<!-- Insert inside the top-level <ossec_config> ... </ossec_config> -->
+<!-- ========================================================= -->
+
+<!-- 1) ACTIVE RESPONSE: auto-block brute-force source IPs ----- -->
+<!-- firewall-drop command ships with Wazuh by default; this -->
+<!-- references it. timeout=600s, fires on the brute-force rules. -->
+
+<active-response>
+  <command>firewall-drop</command>
+  <location>local</location>
+  <rules_id>5712,5720,5763</rules_id>
+  <timeout>600</timeout>
+</active-response>
+
+<!-- NOTE on the "5 failures" threshold:
+     Rules 5712/5720/5763 are themselves frequency/composite rules that
+     already fire only AFTER repeated failures. The cleanest way to enforce
+     exactly "5 failures" is a composite rule (see local_rules.xml below,
+     rule 100100) and point active-response at THAT rule id instead, OR
+     keep the stock rules above which trigger on Wazuh's built-in
+     brute-force frequency. Pick ONE block - don't run both. -->
+
+
+<!-- 2) TELEGRAM INTEGRATION: push level>=10 alerts ------------ -->
+<!-- hook_url = full bot sendMessage URL (token embedded).
+     api_key  = your Telegram chat id.
+     Fill BOTH from ~/.hermes/.env on VM108:
+       TELEGRAM_BOT_TOKEN  -> hook_url  https://api.telegram.org/bot<TOKEN>/sendMessage
+       TELEGRAM_HOME_CHANNEL (chat id)  -> api_key -->
+
+<integration>
+  <name>custom-telegram</name>
+  <hook_url>https://api.telegram.org/bot__BOT_TOKEN__/sendMessage</hook_url>
+  <api_key>__CHAT_ID__</api_key>
+  <level>10</level>
+  <alert_format>json</alert_format>
+</integration>
