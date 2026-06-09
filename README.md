@@ -18,6 +18,10 @@ lab and renders a self-contained, dark-themed HTML operations dashboard — no
 framework, no database, no build step. A cron job regenerates it every 15 minutes;
 any web server serves the static file.
 
+![NOC Dashboard](docs/noc-dashboard.png)
+
+*Live dashboard — dark terminal aesthetic, section management, edit mode, 40+ integrations*
+
 ```
 ┌─ PROXMOX ──────┐ ┌─ DOCKER ───────┐ ┌─ PBS ──────────┐ ┌─ WAZUH SIEM ───┐
 │ 9/10 VMs up    │ │ 42 running     │ │ 4 stores OK    │ │ 5/5 agents     │
