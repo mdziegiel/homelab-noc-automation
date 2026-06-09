@@ -1759,7 +1759,7 @@ def donut(name, pct):
 
 def card(title, badge_state, body_html, sub=""):
     sub_html = f'<div class="sub">{sub}</div>' if sub else ""
-    return f"""<div class="card s-{badge_state}">
+    return f"""<div class="card s-{badge_state}" data-title="{esc(title)}" data-state="{badge_state}" onclick="focusCard(this)" style="cursor:pointer">
       <div class="card-h"><span class="dot"></span><h3>{esc(title)}</h3></div>
       <div class="card-b">{body_html}</div>{sub_html}
     </div>"""
@@ -2477,6 +2477,7 @@ PAGE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="60">
 <title>MRDTech Homelab NOC</title>
+<link rel="icon" id="noc-favicon" type="image/svg+xml" href="">
 <style>
   :root {{
     --bg:#0a0e0a; --panel:#0f150f; --panel2:#121a12; --line:#1c2a1c;
@@ -2630,6 +2631,52 @@ PAGE = """<!DOCTYPE html>
   .b-none {{ background:#1a241a; }}
   footer {{ text-align:center; color:#2c402c; font-size:10px; padding:20px;
     letter-spacing:2px; }}
+  /* card modal */
+  .card-modal {{ display:none; position:fixed; top:0; left:0; right:0; bottom:0;
+    background:rgba(0,0,0,0.82); backdrop-filter:blur(4px); z-index:9000;
+    align-items:center; justify-content:center; }}
+  .card-modal-box {{ background:var(--panel); border:1px solid var(--line);
+    border-radius:8px; padding:24px; max-width:780px; width:92%; max-height:85vh;
+    overflow-y:auto; position:relative; box-shadow:0 8px 32px rgba(0,0,0,0.6); }}
+  .card-modal-close {{ position:absolute; top:10px; right:14px; background:none;
+    border:none; color:var(--muted); font-size:20px; cursor:pointer;
+    line-height:1; padding:4px; }}
+  .card-modal-close:hover {{ color:var(--green); }}
+  .card-modal-title {{ font-size:16px; font-weight:700; color:var(--green);
+    letter-spacing:0.1em; text-transform:uppercase; margin-bottom:16px;
+    padding-right:32px; }}
+  .card-modal-body {{ font-size:13px; color:var(--txt); }}
+  /* alert panel */
+  .alert-overlay {{ display:none; position:fixed; top:0; left:0; right:0; bottom:0;
+    background:rgba(0,0,0,0.4); z-index:8000; }}
+  .alert-panel {{ position:fixed; top:0; right:-400px; width:380px; height:100vh;
+    background:var(--panel); border-left:1px solid var(--line); z-index:8001;
+    display:flex; flex-direction:column; transition:right 0.3s ease;
+    box-shadow:-4px 0 20px rgba(0,0,0,0.5); }}
+  .alert-panel.open {{ right:0; }}
+  .alert-panel-hdr {{ display:flex; align-items:center; justify-content:space-between;
+    padding:12px 16px; border-bottom:1px solid var(--line);
+    font-size:11px; letter-spacing:0.12em; color:var(--green); font-weight:700; }}
+  .alert-panel-hdr button {{ background:none; border:1px solid var(--line);
+    color:var(--muted); cursor:pointer; padding:3px 8px; font-size:11px;
+    border-radius:3px; }}
+  .alert-panel-hdr button:hover {{ color:var(--green); border-color:var(--green); }}
+  .alert-feed {{ list-style:none; margin:0; padding:8px; overflow-y:auto; flex:1; }}
+  .alert-feed li {{ display:flex; flex-direction:column; gap:2px;
+    padding:8px 10px; border-bottom:1px solid var(--line);
+    font-size:12px; }}
+  .alert-feed li:last-child {{ border-bottom:none; }}
+  .ah-ts {{ color:var(--muted); font-size:10px; letter-spacing:0.06em; }}
+  .ah-text {{ color:var(--txt); }}
+  .alert-panel-empty {{ color:var(--muted); font-size:12px; text-align:center;
+    padding:32px 16px; }}
+  .bell-badge {{ background:var(--crit); color:#fff; border-radius:50%;
+    font-size:9px; padding:1px 4px; margin-left:3px;
+    display:none; vertical-align:super; }}
+  .theme-btn {{ background:none; border:1px solid var(--line); color:var(--muted);
+    cursor:pointer; padding:4px 10px; font-size:11px; border-radius:3px;
+    letter-spacing:.05em; }}
+  .theme-btn:hover {{ color:var(--green); border-color:var(--green); }}
 </style></head>
 <body>
   <div class="topbar">
@@ -2639,6 +2686,7 @@ PAGE = """<!DOCTYPE html>
     <div class="top-right">
       <div class="ts">UPDATED <b>{ts}</b></div>
       <div class="health h-{overall}"><span class="led"></span>{overall_txt}</div>
+      <button id="alert-bell" class="theme-btn" onclick="toggleAlertPanel()" title="Alert history">&#128276;<span id="bell-badge" class="bell-badge"></span></button>
     </div>
   </div>
   <div class="wrap">
@@ -2660,7 +2708,122 @@ PAGE = """<!DOCTYPE html>
       <div class="panelbox"><h4>ACTIVE ALERTS</h4>{alert_block}</div>
     </div>
   </div>
+  <div id="card-modal" class="card-modal" onclick="closeCardModal(event)">
+    <div class="card-modal-box">
+      <button class="card-modal-close" onclick="closeCardModal(null)">&times;</button>
+      <div id="card-modal-title" class="card-modal-title"></div>
+      <div id="card-modal-body" class="card-modal-body"></div>
+    </div>
+  </div>
+  <div id="alert-overlay" class="alert-overlay" onclick="toggleAlertPanel()"></div>
+  <div id="alert-panel" class="alert-panel">
+    <div class="alert-panel-hdr">
+      <span>ALERT HISTORY</span>
+      <button onclick="clearAlertHistory()">CLEAR</button>
+      <button onclick="toggleAlertPanel()">&times;</button>
+    </div>
+    <ul id="alert-feed" class="alert-feed"></ul>
+    <div class="alert-panel-empty" id="alert-empty">No alert history recorded yet.</div>
+  </div>
   <footer>MRDTECH INFRASTRUCTURE MONITORING · AUTO-REFRESH 60s · REGEN 15m</footer>
+<script>
+(function() {{
+  window.focusCard = function(el) {{
+    var title = el.getAttribute('data-title');
+    var state = el.getAttribute('data-state');
+    var body = el.querySelector('.card-b');
+    var modal = document.getElementById('card-modal');
+    document.getElementById('card-modal-title').textContent = title;
+    var mb = document.getElementById('card-modal-body');
+    mb.innerHTML = body ? body.innerHTML : '';
+    modal.style.display = 'flex';
+    document.body.style.overflow = 'hidden';
+  }};
+  window.closeCardModal = function(evt) {{
+    if (evt && evt.target !== document.getElementById('card-modal')) return;
+    document.getElementById('card-modal').style.display = 'none';
+    document.body.style.overflow = '';
+  }};
+  document.addEventListener('keydown', function(e) {{
+    if (e.key === 'Escape') closeCardModal(null);
+  }});
+
+  function updateFavicon() {{
+    var health = document.querySelector('.health');
+    var color = '#555555';
+    if (health) {{
+      if (health.classList.contains('h-ok')) color = '#00ff41';
+      else if (health.classList.contains('h-warn')) color = '#ffcc00';
+      else if (health.classList.contains('h-crit')) color = '#ff3b3b';
+      else if (health.classList.contains('h-degraded')) color = '#7a7a7a';
+    }}
+    var svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><circle cx="16" cy="16" r="14" fill="' + color + '"/></svg>';
+    var el = document.getElementById('noc-favicon');
+    if (el) el.href = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+  }}
+  updateFavicon();
+
+  var ALERT_KEY = 'noc-alert-history';
+  var MAX_ALERTS = 100;
+  function loadAlertHistory() {{ return JSON.parse(localStorage.getItem(ALERT_KEY) || '[]'); }}
+  function saveAlertHistory(h) {{ localStorage.setItem(ALERT_KEY, JSON.stringify(h)); }}
+  function ingestCurrentAlerts() {{
+    var items = document.querySelectorAll('.alerts li');
+    if (!items.length) return;
+    var history = loadAlertHistory();
+    var existing = new Set(history.map(function(x) {{ return x.text; }}));
+    var ts = new Date().toISOString();
+    var added = false;
+    items.forEach(function(li) {{
+      var text = li.textContent.trim();
+      if (!text) return;
+      if (!existing.has(text)) {{
+        history.unshift({{ text: text, ts: ts }});
+        existing.add(text);
+        added = true;
+      }}
+    }});
+    if (added) {{
+      if (history.length > MAX_ALERTS) history = history.slice(0, MAX_ALERTS);
+      saveAlertHistory(history);
+    }}
+  }}
+  function renderAlertHistory() {{
+    var history = loadAlertHistory();
+    var feed = document.getElementById('alert-feed');
+    var empty = document.getElementById('alert-empty');
+    if (!feed) return;
+    feed.innerHTML = '';
+    if (!history.length) {{
+      if (empty) empty.style.display = 'block';
+      return;
+    }}
+    if (empty) empty.style.display = 'none';
+    history.forEach(function(item) {{
+      var li = document.createElement('li');
+      var d = new Date(item.ts);
+      var ts_str = d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], {{hour:'2-digit',minute:'2-digit'}});
+      li.innerHTML = '<span class="ah-ts">' + ts_str + '</span><span class="ah-text">' + item.text + '</span>';
+      feed.appendChild(li);
+    }});
+    var badge = document.getElementById('bell-badge');
+    if (badge) {{ badge.textContent = history.length > 9 ? '9+' : String(history.length); badge.style.display = history.length ? 'inline-block' : 'none'; }}
+  }}
+  window.toggleAlertPanel = function() {{
+    var panel = document.getElementById('alert-panel');
+    var overlay = document.getElementById('alert-overlay');
+    var open = panel.classList.toggle('open');
+    if (overlay) overlay.style.display = open ? 'block' : 'none';
+    if (open) renderAlertHistory();
+  }};
+  window.clearAlertHistory = function() {{
+    localStorage.removeItem(ALERT_KEY);
+    renderAlertHistory();
+  }};
+  ingestCurrentAlerts();
+  renderAlertHistory();
+}})();
+</script>
 </body></html>"""
 
 
