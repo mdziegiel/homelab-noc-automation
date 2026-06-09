@@ -22,6 +22,8 @@ state/
 dashboard_trends.json
 *.bak
 *.bak.*
+*.bak-*
+*.noncanonical-bak-*
 *.backup
 *.removed
 __pycache__/
