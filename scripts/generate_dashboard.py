@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Homelab Homelab NOC Dashboard generator.
+MRDTech Homelab NOC Dashboard generator.
 Collects all infra sources (stdlib only, per-source isolation) and renders a
 single self-contained static HTML file (inline CSS + SVG, no external assets).
 Run every 15 min via cron; served by a tiny http.server systemd unit on :8080.
@@ -18,7 +18,7 @@ except Exception:
     pass
 
 ENV_PATH = os.path.expanduser("~/.hermes/.env")
-OUT_DIR = os.path.expanduser("~/homelab-dashboard")
+OUT_DIR = os.path.expanduser("~/mrdtech-dashboard")
 OUT_FILE = os.path.join(OUT_DIR, "index.html")
 TIMEOUT = 15
 CERT_WARN_DAYS = 30
@@ -39,28 +39,16 @@ def load_env(path):
 
 E = load_env(ENV_PATH)
 
-# ---------------------------------------------------------------------------
-# Host resolution. Every infrastructure host is read from .env so this script
-# is portable. Defaults below are SANITIZED example IPs (RFC1918 10.0.0.0/24) --
-# replace them in your .env with your real hosts. See .env.template.
-# ---------------------------------------------------------------------------
-HOSTS = {
-    "UNIFI_HOST":   E.get("UNIFI_HOST",   "10.0.0.1"),
-    "ADGUARD_HOST": E.get("ADGUARD_HOST", "10.0.0.21"),
-    "URBACKUP_HOST": E.get("URBACKUP_HOST", "10.0.0.76"),
-    "PBS_HOST":     E.get("PBS_HOST",     "10.0.0.77"),
-    "WAZUH_HOST":   E.get("WAZUH_HOST",   "10.0.0.233"),
-    "HERMES_HOST":  E.get("HERMES_HOST",  "10.0.0.234"),
-    "DOCKER_HOST_IP": E.get("DOCKER_HOST_IP", "10.0.0.237"),
-    "PROXMOX_HOST": E.get("PROXMOX_HOST", "10.0.0.251"),
-}
-UNIFI_HOST = HOSTS["UNIFI_HOST"]
-ADGUARD_HOST = HOSTS["ADGUARD_HOST"]
-URBACKUP_HOST = HOSTS["URBACKUP_HOST"]
-PBS_HOST = HOSTS["PBS_HOST"]
-WAZUH_HOST = HOSTS["WAZUH_HOST"]
-DOCKER_HOST_IP = HOSTS["DOCKER_HOST_IP"]
-PROXMOX_HOST = HOSTS["PROXMOX_HOST"]
+def _service_base_url(host_or_url, scheme="https", port=None):
+    """Normalize .env host fields that may be bare hosts or full URLs."""
+    raw = str(host_or_url or "").strip().rstrip("/")
+    if not raw:
+        return ""
+    if raw.startswith("http://") or raw.startswith("https://"):
+        return raw
+    if port is not None and ":" not in raw:
+        raw = f"{raw}:{port}"
+    return f"{scheme}://{raw}"
 
 
 def _b64(s):
@@ -105,7 +93,7 @@ def collect_proxmox():
          "mem_used": 0.0, "mem_total": 0.0, "node": "?", "uptime_d": 0,
          "down_vms": [], "storage": []}
     auth = _pmox_auth()
-    base = f"https://{PROXMOX_HOST}:8006/api2/json"
+    base = _service_base_url(E.get("PROXMOX_HOST", "10.10.10.251"), "https", 8006) + "/api2/json"
     nodes = jget(f"{base}/nodes", auth)["data"]
     node = None
     for n in nodes:
@@ -144,6 +132,113 @@ def collect_proxmox():
     return d
 
 
+def _smart_raw_int(v):
+    m = re.search(r"-?\d+", str(v or ""))
+    return int(m.group(0)) if m else 0
+
+
+def _smart_short_model(disk):
+    return (disk.get("model") or disk.get("serial") or disk.get("devpath") or "disk")[:26]
+
+
+def collect_smart_health():
+    """Read-only SMART/disk health via Proxmox API.
+
+    Proxmox exposes host physical disk SMART. VM disks are virtual block devices;
+    guest SMART is not exposed through Proxmox for those, so the tile states that
+    explicitly instead of hallucinating green health inside every VM.
+    """
+    d = {"state": "ok", "checked": 0, "passed": 0, "warn": 0, "fail": 0,
+         "prefail": 0, "problems": [], "disks": [], "vm_disks": 0, "vm_note": ""}
+    auth = _pmox_auth()
+    base = _service_base_url(E.get("PROXMOX_HOST", "10.10.10.251"), "https", 8006) + "/api2/json"
+    nodes = jget(f"{base}/nodes", auth).get("data", [])
+    if not nodes:
+        return {"state": "degraded", "note": "no Proxmox nodes visible", "checked": 0,
+                "passed": 0, "warn": 0, "fail": 0, "prefail": 0, "problems": [], "disks": []}
+
+    critical_names = ("realloc", "pending", "uncorrect", "offline_uncorrect", "reported_uncorrect",
+                      "command_timeout", "media_wearout", "media_and_data_integrity")
+    for n in nodes:
+        node = n.get("node")
+        if not node:
+            continue
+        try:
+            vms = jget(f"{base}/nodes/{urllib.parse.quote(node)}/qemu", auth).get("data", [])
+            for vm in vms:
+                try:
+                    cfg = jget(f"{base}/nodes/{urllib.parse.quote(node)}/qemu/{vm.get('vmid')}/config", auth).get("data", {})
+                    d["vm_disks"] += sum(1 for k in cfg if re.match(r"^(ide|sata|scsi|virtio)\d+$", k))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        disks = jget(f"{base}/nodes/{urllib.parse.quote(node)}/disks/list", auth).get("data", [])
+        for disk in disks:
+            dev = disk.get("devpath")
+            if not dev:
+                continue
+            rec = {"node": node, "dev": dev, "model": _smart_short_model(disk),
+                   "health": disk.get("health") or "UNKNOWN", "wearout": disk.get("wearout"),
+                   "issues": []}
+            d["checked"] += 1
+            health = str(rec["health"]).upper()
+            if health in ("PASSED", "OK", "GOOD"):
+                d["passed"] += 1
+            elif health in ("UNKNOWN", "N/A", ""):
+                d["warn"] += 1
+                rec["issues"].append("SMART health unknown")
+            else:
+                d["fail"] += 1
+                rec["issues"].append(f"SMART health {rec['health']}")
+            try:
+                url = f"{base}/nodes/{urllib.parse.quote(node)}/disks/smart?disk={urllib.parse.quote(dev, safe='')}"
+                sm = jget(url, auth).get("data", {})
+                txt = sm.get("text", "") or ""
+                attrs = sm.get("attributes", []) or []
+                for a in attrs:
+                    name = str(a.get("name", ""))
+                    fail = str(a.get("fail", "-")).strip()
+                    flags = str(a.get("flags", ""))
+                    raw = _smart_raw_int(a.get("raw"))
+                    is_prefail = flags.startswith("P") or flags.startswith("PO")
+                    if is_prefail:
+                        d["prefail"] += 1
+                    lname = name.lower()
+                    if fail and fail != "-":
+                        rec["issues"].append(f"{name} {fail}")
+                    elif raw > 0 and any(x in lname for x in critical_names):
+                        rec["issues"].append(f"{name} raw={raw}")
+                # NVMe text-only SMART checks.
+                m = re.search(r"Critical Warning:\s*(0x[0-9a-fA-F]+|\d+)", txt)
+                if m and int(m.group(1), 0) != 0:
+                    rec["issues"].append(f"NVMe critical warning {m.group(1)}")
+                m = re.search(r"Media and Data Integrity Errors:\s*([\d,]+)", txt)
+                if m and int(m.group(1).replace(",", "")) > 0:
+                    rec["issues"].append(f"NVMe media errors {m.group(1)}")
+                m = re.search(r"Temperature:\s*(\d+)\s+Celsius", txt)
+                if m and int(m.group(1)) >= 70:
+                    rec["issues"].append(f"temperature {m.group(1)}C")
+            except Exception as e:
+                d["warn"] += 1
+                rec["issues"].append(f"SMART detail unavailable: {type(e).__name__}")
+            if rec["issues"]:
+                d["problems"].append(f"{rec['model']} {dev}: " + "; ".join(rec["issues"][:3]))
+            d["disks"].append(rec)
+    if not d["checked"]:
+        d["state"] = "degraded"
+        d["note"] = "no SMART-capable disks returned by Proxmox"
+    elif d["fail"] or any("raw=" in p or "critical" in p.lower() for p in d["problems"]):
+        d["state"] = "crit"
+    elif d["warn"] or d["problems"]:
+        d["state"] = "warn"
+    if d["vm_disks"]:
+        d["vm_note"] = f'{d["vm_disks"]} VM virtual disk(s); guest SMART not exposed by Proxmox'
+        if d["state"] == "ok":
+            d["state"] = "degraded"
+    return d
+
+
 def collect_docker():
     d = {"state": "ok", "running": 0, "total": 0, "envs": 0, "bad": []}
     base = E.get("PORTAINER_URL", "").strip().rstrip("/")
@@ -178,7 +273,7 @@ def collect_docker():
 
 def collect_pbs():
     d = {"state": "ok", "ok": 0, "fail": 0, "run": 0, "last_backup": "?", "datastores": []}
-    tk = jget(f"https://{PBS_HOST}:8007/api2/json/access/ticket",
+    tk = jget("https://10.10.10.77:8007/api2/json/access/ticket",
               data=urllib.parse.urlencode({
                   "username": E.get("PBS_USERNAME", "root@pam"),
                   "password": E.get("PBS_PASSWORD", "")}),
@@ -186,7 +281,7 @@ def collect_pbs():
               method="POST")["data"]["ticket"]
     cookie = {"Cookie": f"PBSAuthCookie={urllib.parse.quote(tk, safe='')}"}
     since = int(time.time()) - 86400
-    tasks = jget(f"https://{PBS_HOST}:8007/api2/json/nodes/localhost/tasks"
+    tasks = jget(f"https://10.10.10.77:8007/api2/json/nodes/localhost/tasks"
                  f"?since={since}&limit=500", cookie)["data"]
     last_backup_epoch = 0
     for t in tasks:
@@ -213,7 +308,7 @@ def collect_pbs():
         d["state"] = "crit"
     # datastore usage
     try:
-        dss = jget(f"https://{PBS_HOST}:8007/api2/json/status/datastore-usage", cookie)["data"]
+        dss = jget("https://10.10.10.77:8007/api2/json/status/datastore-usage", cookie)["data"]
         for ds in dss:
             tot = ds.get("total", 0) or 0
             used = ds.get("used", 0) or 0
@@ -271,7 +366,7 @@ def collect_uptime_kuma():
 def collect_crowdsec():
     d = {"state": "ok", "bans": 0, "local_bans": 0, "detections_24h": None, "top": []}
     apikey = E.get("CROWDSEC_API_KEY", "")
-    dec = jget(f"http://{DOCKER_HOST_IP}:18080/v1/decisions", {"X-Api-Key": apikey})
+    dec = jget("http://10.10.10.237:18080/v1/decisions", {"X-Api-Key": apikey})
     if isinstance(dec, list):
         d["bans"] = len(dec)
         local = [x for x in dec if x.get("origin") not in ("lists", "CAPI")]
@@ -283,10 +378,10 @@ def collect_crowdsec():
     mp = E.get("CROWDSEC_MACHINE_PASS", "")
     if mu and mp:
         try:
-            tok = jget(f"http://{DOCKER_HOST_IP}:18080/v1/watchers/login",
+            tok = jget("http://10.10.10.237:18080/v1/watchers/login",
                        {"Content-Type": "application/json"},
                        json.dumps({"machine_id": mu, "password": mp}).encode(), "POST")["token"]
-            alerts = jget(f"http://{DOCKER_HOST_IP}:18080/v1/alerts?since=24h&limit=500",
+            alerts = jget("http://10.10.10.237:18080/v1/alerts?since=24h&limit=500",
                           {"Authorization": "Bearer " + tok})
             if isinstance(alerts, list):
                 def is_local(a):
@@ -301,10 +396,10 @@ def collect_crowdsec():
 
 def collect_wazuh():
     d = {"state": "ok", "active": 0, "total": 0, "down": []}
-    jwt = req(f"https://{WAZUH_HOST}:55000/security/user/authenticate?raw=true",
+    jwt = req("https://10.10.10.233:55000/security/user/authenticate?raw=true",
               {"Authorization": "Basic " + _b64(
-                  f"{E.get('WAZUH_API_USER', 'YOUR_WAZUH_API_USER')}:{E.get('WAZUH_API_PASSWORD','')}")}).strip()
-    ag = jget(f"https://{WAZUH_HOST}:55000/agents?limit=500",
+                  f"{E.get('WAZUH_API_USER','hermes')}:{E.get('WAZUH_API_PASSWORD','')}")}).strip()
+    ag = jget("https://10.10.10.233:55000/agents?limit=500",
               {"Authorization": f"Bearer {jwt}"})["data"]["affected_items"]
     d["total"] = len(ag)
     d["active"] = sum(1 for a in ag if a.get("status") == "active")
@@ -317,7 +412,7 @@ def collect_wazuh():
     iu = E.get("WAZUH_INDEXER_USER", "").strip()
     ip = E.get("WAZUH_INDEXER_PASS", "").strip()
     if iu and ip:
-        ix = E.get("WAZUH_INDEXER_HOST", f"https://{WAZUH_HOST}:9200").rstrip("/")
+        ix = E.get("WAZUH_INDEXER_HOST", "https://10.10.10.233:9200").rstrip("/")
         try:
             q = {"size": 0,
                  "query": {"bool": {"filter": [
@@ -336,12 +431,75 @@ def collect_wazuh():
     return d
 
 
+def collect_malware_sources():
+    """Detection-source tiles (read-only) from the Wazuh indexer, last 24h.
+
+    Liveness is EXPLICIT, never inferred from alert counts (zero alerts must not
+    masquerade as "installed and clean" on a security tile). Each source carries
+    {live: bool, count: int|None}:
+      - not live  -> render "—" (pending install/enrollment)
+      - live, 0   -> render "0" (installed, no detections in 24h)
+      - live, >0  -> render the count in warn (active detections)
+
+    Flip MALWARE_SOURCE_LIVE[<src>] = True as each source is actually installed
+    and confirmed emitting (ClamAV/YARA Tasks 1-2; Defender = Windows task)."""
+    # ---- explicit per-source liveness registry (data layer, not count-derived) ----
+    MALWARE_SOURCE_LIVE = {
+        "clamav": True,       # live on 233 (EICAR -> rule 52502 confirmed 2026-06-09)
+        "yara": True,         # live on 233 (EICAR -> rule 108001 confirmed 2026-06-09)
+        "virustotal": True,   # already integrated and flowing
+        "defender": False,    # -> True after Defender->Wazuh enrollment (Windows task)
+    }
+    SRC_QUERY = {
+        # Built-in 0320 ClamAV rules use groups clamd/freshclam/virus (NOT "clamav").
+        # Match the clamd group (covers detections rule 52502/52511 + daemon events).
+        "clamav": {"term": {"rule.groups": "clamd"}},
+        "yara": {"term": {"rule.groups": "yara"}},
+        "virustotal": {"term": {"rule.groups": "virustotal"}},
+        "defender": {"match_phrase": {
+            "data.win.system.providerName": "Microsoft-Windows-Windows Defender"}},
+    }
+    d = {"state": "ok",
+         "sources": {k: {"live": v, "count": None}
+                     for k, v in MALWARE_SOURCE_LIVE.items()}}
+    iu = E.get("WAZUH_INDEXER_USER", "").strip()
+    ip = E.get("WAZUH_INDEXER_PASS", "").strip()
+    if not (iu and ip):
+        d["state"] = "degraded"
+        d["note"] = "indexer creds not set"
+        return d
+    ix = E.get("WAZUH_INDEXER_HOST", "https://10.10.10.233:9200").rstrip("/")
+    auth = {"Authorization": "Basic " + _b64(f"{iu}:{ip}")}
+
+    def cnt(extra):
+        q = {"size": 0, "query": {"bool": {"filter": [
+            {"range": {"@timestamp": {"gte": "now-24h"}}}, extra]}}}
+        res = jget(f"{ix}/wazuh-alerts-*/_search", auth, data=q, method="POST")
+        tot = res.get("hits", {}).get("total", {})
+        return tot.get("value", tot) if isinstance(tot, dict) else tot
+
+    # only query the 24h count for sources explicitly marked live
+    for key, live in MALWARE_SOURCE_LIVE.items():
+        if not live:
+            continue
+        try:
+            d["sources"][key]["count"] = cnt(SRC_QUERY[key])
+        except Exception as e:
+            d["sources"][key]["err"] = type(e).__name__
+    # active detections on any live source escalate the card to warn
+    hits = sum(s["count"] for s in d["sources"].values()
+               if s["live"] and isinstance(s["count"], int))
+    if hits:
+        d["state"] = "warn"
+    return d
+
+
 def collect_unifi():
     d = {"state": "ok", "wan": "?", "wan_ip": "?", "clients": 0, "ips_24h": 0,
          "latency": None, "down_mbps": None, "up_mbps": None, "devices": [],
          "ssids": [], "month_rx": None, "month_tx": None, "month_total": None,
          "pia": None}
-    GW = f"https://{UNIFI_HOST}"
+    GW = "https://10.10.10.1"
     NET = GW + "/proxy/network/api/s/default"
     cj = http.cookiejar.CookieJar()
     op = urllib.request.build_opener(
@@ -487,7 +645,7 @@ def collect_unifi():
 
 def collect_adguard():
     d = {"state": "ok", "queries": 0, "blocked": 0, "block_pct": 0.0, "avg_ms": 0.0}
-    s = jget(f"http://{ADGUARD_HOST}/control/stats",
+    s = jget("http://10.10.10.21/control/stats",
              {"Authorization": "Basic " + _b64(f"mdziegiel:{E.get('ADGUARD_PASSWORD','')}")})
     tot = s.get("num_dns_queries", 0)
     blk = s.get("num_blocked_filtering", 0)
@@ -499,10 +657,10 @@ def collect_adguard():
 
 
 def collect_urbackup():
-    """URBackup web API (salt/login/status). User is admin (URBACKUP_USERNAME)."""
+    """URBackup web API (salt/login/status). User is michaeld (URBACKUP_USERNAME)."""
     d = {"state": "ok", "total": 0, "online": 0, "clients": [], "problems": []}
-    base = E.get("URBACKUP_URL", f"http://{URBACKUP_HOST}:55414").rstrip("/")
-    user = E.get("URBACKUP_USERNAME", "admin")
+    base = E.get("URBACKUP_URL", "http://10.10.10.76:55414").rstrip("/")
+    user = E.get("URBACKUP_USERNAME", "michaeld")
     pw = E.get("URBACKUP_PASSWORD", "")
     if not pw or pw.startswith("<"):
         return {"state": "degraded", "note": "URBACKUP_PASSWORD not set",
@@ -841,7 +999,7 @@ def collect_overseerr():
     # public domain so a container/IP change still has a chance. The 403 seen
     # historically was a TRUNCATED api key, not auth scheme / Cloudflare.
     candidates = [base]
-    dom = "https://overseerr.homelab.me"
+    dom = "https://overseerr.mrdtech.me"
     if dom != base:
         candidates.append(dom)
     last_err = None
@@ -1021,7 +1179,8 @@ def collect_npm():
         return {"state": "degraded", "note": "NPM creds not set",
                 "hosts": 0, "enabled": 0, "disabled": 0, "certs": 0, "problems": []}
     d = {"state": "ok", "hosts": 0, "enabled": 0, "disabled": 0,
-         "errored": 0, "certs": 0, "certs_expiring": 0, "problems": []}
+         "errored": 0, "certs": 0, "certs_expiring": 0, "problems": [],
+         "cert_list": []}
     tok = jget(f"{base}/api/tokens",
                data={"identity": email, "secret": pw}, method="POST").get("token")
     if not tok:
@@ -1050,14 +1209,20 @@ def collect_npm():
             exp = c.get("expires_on")
             if not exp:
                 continue
+            nm = (c.get("domain_names") or [c.get("nice_name") or "?"])[0]
+            prov = c.get("provider") or ""
             try:
                 ep = time.mktime(time.strptime(exp[:19], "%Y-%m-%dT%H:%M:%S"))
-                if (ep - now) / 86400 <= 14:
+                days = int((ep - now) / 86400)
+                d["cert_list"].append({"name": nm, "days": days, "provider": prov})
+                if days <= 14:
                     d["certs_expiring"] += 1
                     d["problems"].append(
-                        f"cert expiring: {(c.get('nice_name') or c.get('domain_names',['?'])[0])}")
+                        f"cert expiring: {(c.get('nice_name') or nm)}")
             except Exception:
                 pass
+        # soonest first; cap absurd custom-cert lifetimes for sane display
+        d["cert_list"].sort(key=lambda x: x["days"])
     except Exception:
         pass
     if d["errored"]:
@@ -1122,6 +1287,121 @@ def collect_tailscale():
     return d
 
 
+def _lc_get_jwt(api_key, oid):
+    data = urllib.parse.urlencode({"secret": api_key, "oid": oid}).encode()
+    r = urllib.request.Request("https://jwt.limacharlie.io", data=data,
+                               headers={"Content-Type": "application/x-www-form-urlencoded"},
+                               method="POST")
+    return json.loads(urllib.request.urlopen(r, timeout=TIMEOUT, context=CTX).read().decode())["jwt"]
+
+
+def _lc_unwrap(raw):
+    """LimaCharlie Insight returns gzip+base64 JSON when is_compressed=true."""
+    if not raw:
+        return []
+    import zlib as _zlib
+    try:
+        return json.loads(_zlib.decompress(base64.b64decode(raw), 16 + _zlib.MAX_WBITS).decode())
+    except Exception:
+        return []
+
+
+def collect_limacharlie():
+    """Read-only LimaCharlie sensor/detection summary.
+
+    Only uses GET endpoints:
+      - /v1/sensors/{oid}
+      - /v1/sensors/{oid}?is_online_only=true
+      - /v1/insight/{oid}/detections
+    No tasking, isolation, tags, policy, or mutation endpoints. Anton approves.
+    """
+    api_key = E.get("LIMACHARLIE_API_KEY", "").strip()
+    oid = E.get("LIMACHARLIE_OID", "").strip()
+    if not api_key or api_key.startswith("<") or not oid or oid.startswith("<"):
+        return {"state": "degraded", "note": "LimaCharlie creds not set",
+                "total": 0, "online": 0, "offline": 0,
+                "detections_24h": None, "top": [], "offline_hosts": []}
+
+    jwt = _lc_get_jwt(api_key, oid)
+    auth = {"Authorization": f"Bearer {jwt}"}
+    base = "https://api.limacharlie.io/v1"
+
+    def get_all_sensors(online_only=False):
+        sensors = []
+        token = None
+        # LimaCharlie paginates with continuation_token. Hard cap prevents an
+        # accidental infinite loop if the API changes shape.
+        for _ in range(20):
+            qp = {"limit": "500"}
+            if token:
+                qp["continuation_token"] = token
+            if online_only:
+                qp["is_online_only"] = "true"
+            url = f"{base}/sensors/{urllib.parse.quote(oid)}?{urllib.parse.urlencode(qp)}"
+            res = jget(url, auth)
+            sensors.extend(res.get("sensors", []))
+            token = res.get("continuation_token")
+            if not token:
+                break
+        return sensors
+
+    all_sensors = get_all_sensors(False)
+    online_sensors = get_all_sensors(True)
+    total = len(all_sensors)
+    online = len(online_sensors)
+    online_sids = {str(s.get("sid", "")) for s in online_sensors if s.get("sid")}
+    offline = max(0, total - online)
+    offline_hosts = []
+    for s in all_sensors:
+        sid = str(s.get("sid", ""))
+        if sid not in online_sids:
+            offline_hosts.append(s.get("hostname") or sid[:8] or "unknown")
+    offline_hosts = sorted(offline_hosts)[:5]
+
+    d = {"state": "ok", "total": total, "online": online, "offline": offline,
+         "detections_24h": None, "top": [], "offline_hosts": offline_hosts}
+    if total == 0:
+        d["state"] = "degraded"
+        d["note"] = "no sensor data returned"
+    elif offline:
+        d["state"] = "warn"
+
+    # Recent detections from Insight. If the key lacks Insight perms or the
+    # tenant has no Insight retention, degrade instead of showing fake-green.
+    try:
+        end = int(time.time())
+        start = end - 86400
+        detects = []
+        cursor = "-"
+        for _ in range(10):
+            qp = {"start": str(start), "end": str(end), "cursor": cursor,
+                  "is_compressed": "true", "limit": "200"}
+            url = f"{base}/insight/{urllib.parse.quote(oid)}/detections?{urllib.parse.urlencode(qp)}"
+            res = jget(url, auth)
+            batch = _lc_unwrap(res.get("detects", ""))
+            if isinstance(batch, dict):
+                batch = list(batch.values())
+            detects.extend(batch or [])
+            cursor = res.get("next_cursor")
+            if not cursor:
+                break
+        d["detections_24h"] = len(detects)
+        cats = Counter()
+        for det in detects:
+            if not isinstance(det, dict):
+                continue
+            cats[det.get("cat") or det.get("name") or "uncategorized"] += 1
+        d["top"] = [[k, v] for k, v in cats.most_common(3)]
+        if d["detections_24h"] and d["state"] == "ok":
+            d["state"] = "warn"
+    except Exception as e:
+        d["detections_24h"] = None
+        d["detect_note"] = f"detections unavailable: {type(e).__name__}"
+        if d["state"] == "ok":
+            d["state"] = "degraded"
+    return d
+
+
 def collect_wgdashboard():
     """WGDashboard. Real auth flow is POST /api/authenticate (cookie jar) then
     GET /api/getWireguardConfigurations. Each config returns ConnectedPeers,
@@ -1168,15 +1448,80 @@ def collect_wgdashboard():
         d["state"] = "warn"
     return d
 
+def _fmt_duration(sec):
+    try:
+        sec = int(sec or 0)
+    except Exception:
+        sec = 0
+    d, rem = divmod(sec, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d:
+        return f"{d}d {h}h"
+    if h:
+        return f"{h}h {m}m"
+    return f"{m}m"
+
+
+def collect_wan_health():
+    """Read-only WAN health from UniFi Network health endpoint."""
+    base_host = E.get("UNIFI_URL", "https://10.10.10.1").strip().rstrip("/")
+    user = E.get("UNIFI_USERNAME", "").strip()
+    pw = E.get("UNIFI_PASSWORD", "").strip()
+    if not base_host or not user or not pw or pw.startswith("<"):
+        return {"state": "degraded", "note": "UniFi creds not set", "status": "?",
+                "latency": None, "uptime": None, "down_mbps": None, "up_mbps": None}
+    cj = http.cookiejar.CookieJar()
+    op = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=CTX),
+        urllib.request.HTTPCookieProcessor(cj))
+    op.open(urllib.request.Request(
+        f"{base_host}/api/auth/login",
+        data=json.dumps({"username": user, "password": pw}).encode(),
+        headers={"Content-Type": "application/json"}, method="POST"), timeout=TIMEOUT)
+    csrf = None
+    tok = next((c.value for c in cj if c.name == "TOKEN"), None)
+    if tok:
+        try:
+            part = tok.split(".")[1]
+            part += "=" * (-len(part) % 4)
+            csrf = json.loads(base64.urlsafe_b64decode(part)).get("csrfToken")
+        except Exception:
+            pass
+    hdr = {"Content-Type": "application/json"}
+    if csrf:
+        hdr["X-CSRF-Token"] = csrf
+    net = base_host + "/proxy/network/api/s/default"
+    r = urllib.request.Request(net + "/stat/health", headers=hdr)
+    health = json.loads(op.open(r, timeout=TIMEOUT).read().decode("utf-8", "replace")).get("data", [])
+    wan = next((h for h in health if h.get("subsystem") == "wan"), {})
+    www = next((h for h in health if h.get("subsystem") == "www"), {})
+    status = wan.get("status") or www.get("status") or "?"
+    d = {"state": "ok" if status == "ok" else "crit", "status": status,
+         "wan_ip": wan.get("wan_ip", "?"), "gateway": wan.get("gw_name", "?"),
+         "latency": www.get("latency"), "uptime": www.get("uptime"),
+         "down_mbps": www.get("xput_down"), "up_mbps": www.get("xput_up")}
+    if d["latency"] is None:
+        d["state"] = "degraded" if d["state"] == "ok" else d["state"]
+        d["note"] = "WAN latency unavailable"
+    elif float(d["latency"] or 0) >= 100 and d["state"] == "ok":
+        d["state"] = "warn"
+    if d["uptime"] is not None and int(d["uptime"] or 0) < 3600 and d["state"] == "ok":
+        d["state"] = "warn"
+    return d
+
 
 SOURCES = [
     ("proxmox", collect_proxmox),
+    ("smart", collect_smart_health),
     ("docker", collect_docker),
     ("pbs", collect_pbs),
     ("kuma", collect_uptime_kuma),
     ("crowdsec", collect_crowdsec),
     ("wazuh", collect_wazuh),
+    ("malware_sources", collect_malware_sources),
     ("unifi", collect_unifi),
+    ("wan", collect_wan_health),
     ("adguard", collect_adguard),
     ("urbackup", collect_urbackup),
     ("qnap", collect_qnaps),
@@ -1186,6 +1531,7 @@ SOURCES = [
     ("npm", collect_npm),
     ("tailscale", collect_tailscale),
     ("wgdashboard", collect_wgdashboard),
+    ("limacharlie", collect_limacharlie),
     ("plex", collect_plex),
     ("tautulli", collect_tautulli),
     ("sonarr", collect_sonarr),
@@ -1222,6 +1568,7 @@ def load_trends():
         t = {}
     t.setdefault("daily", {})          # {"YYYY-MM-DD": {metric: value}}
     t.setdefault("kuma_history", {})   # {"monitor": [[epoch, status], ...]}
+    t.setdefault("wan_history", [])    # [[epoch, latency_ms, down_mbps, up_mbps, status], ...]
     return t
 
 
@@ -1269,6 +1616,19 @@ def update_trends(data, now_epoch):
                                            if h[0] >= now_epoch - KUMA_HIST_HOURS * 3600]
                 if not t["kuma_history"][gone]:
                     del t["kuma_history"][gone]
+
+
+
+    # WAN history: append every regen cycle, keep last 24h. This uses UniFi's
+    # read-only WAN health/speedtest fields; zero speed values are retained but
+    # rendered as "no recent speedtest" rather than fake throughput.
+    WAN = data.get("wan", {})
+    if WAN.get("state") not in ("error", "degraded") and WAN.get("latency") is not None:
+        cutoff = now_epoch - 24 * 3600
+        hist = t.setdefault("wan_history", [])
+        hist.append([int(now_epoch), WAN.get("latency"), WAN.get("down_mbps"),
+                     WAN.get("up_mbps"), WAN.get("status", "?")])
+        t["wan_history"] = [h for h in hist if h[0] >= cutoff]
 
     os.makedirs(STATE_DIR, exist_ok=True)
     tmp = TRENDS_FILE + ".tmp"
@@ -1411,6 +1771,7 @@ def render(data, gen_epoch, errors, trends=None):
     K = data.get("kuma", {})
     C = data.get("crowdsec", {})
     W = data.get("wazuh", {})
+    MW = data.get("malware_sources", {})
     U = data.get("unifi", {})
     A = data.get("adguard", {})
     UB = data.get("urbackup", {})
@@ -1428,6 +1789,9 @@ def render(data, gen_epoch, errors, trends=None):
     SB = data.get("sabnzbd", {})
     OV = data.get("overseerr", {})
     PR = data.get("prowlarr", {})
+    LC = data.get("limacharlie", {})
+    SM = data.get("smart", {})
+    WAN = data.get("wan", {})
 
     # overall health
     states = [v.get("state", "error") for v in data.values()]
@@ -1487,6 +1851,34 @@ def render(data, gen_epoch, errors, trends=None):
     kuma_sub = K.get("note") or K.get("error") or (
         ("DOWN: " + ", ".join(K.get("down", []))) if K.get("down") else "all monitors up")
 
+    smart_body = (metric("Host Disks", f'{SM.get("passed",0)}/{SM.get("checked",0)} pass',
+                         "crit" if SM.get("fail") else ("warn" if SM.get("warn") else ("ok" if SM.get("checked") else "")))
+                  + metric("Problems", len(SM.get("problems", [])),
+                           "crit" if SM.get("fail") else ("warn" if SM.get("problems") else ""))
+                  + metric("VM SMART", "n/a" if SM.get("vm_disks") else "—"))
+    if SM.get("problems"):
+        smart_sub = "; ".join(SM.get("problems", [])[:2])
+    else:
+        smart_sub = (SM.get("note") or SM.get("error") or SM.get("vm_note")
+                     or "host SMART passed")
+
+    wh = trends.get("wan_history", [])
+    lat_series = [h[1] for h in wh if len(h) > 1]
+    wan_status = str(WAN.get("status", "?")).upper()
+    speed_down = WAN.get("down_mbps")
+    speed_up = WAN.get("up_mbps")
+    speed_txt = (f'{float(speed_down):.0f}/{float(speed_up):.0f}'
+                 if speed_down not in (None, "") and speed_up not in (None, "") and (float(speed_down or 0) or float(speed_up or 0))
+                 else "n/a")
+    wan_body = (metric("WAN", wan_status,
+                       "crit" if WAN.get("state") == "crit" else ("warn" if WAN.get("state") == "warn" else ("ok" if WAN.get("state") == "ok" else "")))
+                + metric("Latency", f'{WAN.get("latency")}ms' if WAN.get("latency") is not None else "n/a",
+                         "warn" if WAN.get("latency") is not None and float(WAN.get("latency") or 0) >= 100 else "")
+                + metric("Speedtest", speed_txt))
+    wan_body += f'<div class="trend"><span class="trend-lbl">latency {len(lat_series)} samples / 24h</span>{sparkline(lat_series, state="warn" if WAN.get("state") == "warn" else "ok")}</div>'
+    wan_sub = (WAN.get("note") or WAN.get("error")
+               or f'{esc(WAN.get("wan_ip","?"))} · uptime {_fmt_duration(WAN.get("uptime"))} · down/up Mbps from UniFi speedtest history')
+
     # URBackup card
     ub_clients = UB.get("clients", [])
     ub_body = (metric("Clients", f'{UB.get("online",0)}/{UB.get("total",0)} online',
@@ -1516,12 +1908,14 @@ def render(data, gen_epoch, errors, trends=None):
     else:
         ha_sub = (f'{HA.get("domains",0)} domains · {HA.get("notifications",0)} notification(s)')
 
-    row1 = (card("PROXMOX", P.get("state", "error"), prox_body, prox_sub)
+    row1 = (card("WAN / INTERNET", WAN.get("state", "error"), wan_body, wan_sub)
+            + card("PROXMOX", P.get("state", "error"), prox_body, prox_sub)
+            + card("HOME ASSISTANT", HA.get("state", "error"), ha_body, ha_sub)
+            + card("UPTIME KUMA", K.get("state", "error"), kuma_body, kuma_sub)
             + card("DOCKER / PORTAINER", D.get("state", "error"), dock_body, dock_sub)
             + card("PBS BACKUPS", B.get("state", "error"), pbs_body, pbs_sub)
-            + card("UPTIME KUMA", K.get("state", "error"), kuma_body, kuma_sub)
             + card("URBACKUP", UB.get("state", "error"), ub_body, ub_sub)
-            + card("HOME ASSISTANT", HA.get("state", "error"), ha_body, ha_sub))
+            + card("SMART / DISK HEALTH", SM.get("state", "error"), smart_body, smart_sub))
 
     # ---- Row 2: security ----
     daily = trends.get("daily", {})
@@ -1541,12 +1935,12 @@ def render(data, gen_epoch, errors, trends=None):
         ("top: " + ", ".join(f"{k}({v})" for k, v in C.get("top", []))) if C.get("top")
         else "no behavioral bans")
 
-    wz_body = metric("Agents", f'{W.get("active",0)}/{W.get("total",0)} online',
-                     "warn" if W.get("down") else "ok")
+    wz_agent_body = metric("Agents", f'{W.get("active",0)}/{W.get("total",0)} online',
+                           "warn" if W.get("down") else "ok")
     if "alerts_24h" in W:
-        wz_body += metric("Alerts 24h", f'{W.get("alerts_24h",0):,}')
-        wz_body += metric("High/Crit 24h", W.get("high_24h", 0),
-                          "crit" if W.get("high_24h") else "ok")
+        wz_agent_body += metric("Alerts 24h", f'{W.get("alerts_24h",0):,}')
+        wz_agent_body += metric("High/Crit 24h", W.get("high_24h", 0),
+                                "crit" if W.get("high_24h") else "ok")
     wz_sub = W.get("error") or (("offline: " + ", ".join(W.get("down", [])))
                                 if W.get("down") else "all agents reporting")
     if W.get("alerts_err"):
@@ -1624,6 +2018,16 @@ def render(data, gen_epoch, errors, trends=None):
                 + metric("Errored", NPM.get("errored", 0),
                          "crit" if NPM.get("errored", 0) else "")
                 + metric("SSL Certs", NPM.get("certs", 0)))
+    if NPM.get("cert_list"):
+        cert_rows = ""
+        for ct in NPM["cert_list"]:
+            dys = ct["days"]
+            cls = "m-crit" if dys < 7 else ("m-warn" if dys < 21 else "")
+            shown = "expired" if dys < 0 else f"{dys}d"
+            cert_rows += (f'<div class="ubrow {cls}">'
+                          f'<span class="ub-n">{esc(ct["name"])}</span>'
+                          f'<span class="ub-a">{shown}</span></div>')
+        npm_body += '<div class="ublist">' + cert_rows + "</div>"
     if NPM.get("problems"):
         npm_sub = NPM.get("note") or NPM.get("error") or ("; ".join(NPM["problems"][:4]))
     else:
@@ -1650,6 +2054,22 @@ def render(data, gen_epoch, errors, trends=None):
     else:
         ts_sub = f'{TS.get("online",0)}/{TS.get("total",0)} online'
 
+    # LimaCharlie
+    lc_det = LC.get("detections_24h")
+    lc_body = (metric("Sensors", f'{LC.get("online",0)}/{LC.get("total",0)} online',
+                      "warn" if LC.get("offline", 0) else ("ok" if LC.get("total", 0) else ""))
+               + metric("Offline", LC.get("offline", 0),
+                        "warn" if LC.get("offline", 0) else "")
+               + metric("Detections 24h", lc_det if lc_det is not None else "n/a",
+                        "warn" if (lc_det or 0) else ("" if lc_det is None else "ok")))
+    if LC.get("top"):
+        lc_sub = "top: " + ", ".join(f"{k}({v})" for k, v in LC.get("top", []))
+    elif LC.get("offline_hosts"):
+        lc_sub = "offline: " + ", ".join(LC.get("offline_hosts", []))
+    else:
+        lc_sub = (LC.get("note") or LC.get("detect_note") or LC.get("error")
+                  or "all sensors online · no detections")
+
     # WGDashboard (WireGuard)
     wg_body = (metric("Peers Conn.", WG.get("connected", 0),
                       "ok" if WG.get("connected", 0) else "")
@@ -1667,11 +2087,54 @@ def render(data, gen_epoch, errors, trends=None):
     wg_sub = (WG.get("note") or WG.get("error")
               or f'{WG.get("connected",0)} of {WG.get("total_peers",0)} peers connected')
 
-    row2 = (card("CLOUDFLARE", CF.get("state", "error"), cf_body, cf_sub)
+    # ---- Malware Detection Sources card (ClamAV / YARA / VirusTotal / Defender) ----
+    # Explicit three-state tiles (liveness from the data layer, NOT count-inferred):
+    #   not live -> "—" (pending) | live & 0 -> "0" (ok) | live & >0 -> count (warn)
+    def _mwtile(label, key):
+        s = (MW.get("sources") or {}).get(key, {})
+        if not s.get("live"):
+            return metric(label, "—", "")            # pending install/enrollment
+        c = s.get("count")
+        if not isinstance(c, int):
+            return metric(label, "?", "")            # live but query errored
+        return metric(label, f"{c:,}", "warn" if c else "ok")
+    mw_body = (_mwtile("ClamAV", "clamav")
+               + _mwtile("YARA", "yara")
+               + _mwtile("VirusTotal", "virustotal")
+               + _mwtile("Defender", "defender"))
+    _srcs = MW.get("sources") or {}
+    _live_hits = [n for n, k in (("ClamAV", "clamav"), ("YARA", "yara"),
+                                 ("VirusTotal", "virustotal"), ("Defender", "defender"))
+                  if _srcs.get(k, {}).get("live")
+                  and isinstance(_srcs[k].get("count"), int) and _srcs[k]["count"] > 0]
+    _pending = [n for n, k in (("ClamAV", "clamav"), ("YARA", "yara"),
+                               ("Defender", "defender"))
+                if not _srcs.get(k, {}).get("live")]
+    if MW.get("note"):
+        mw_sub = MW["note"]
+    elif _live_hits:
+        mw_sub = "detections 24h: " + ", ".join(_live_hits)
+    elif _pending:
+        mw_sub = "pending: " + ", ".join(_pending)
+    else:
+        mw_sub = "all sources live · no detections 24h"
+
+    _wz_state_rank = {"ok": 0, "degraded": 1, "warn": 2, "crit": 3, "error": 4}
+    wz_combined_state = max((W.get("state", "error"), MW.get("state", "error")),
+                            key=lambda s: _wz_state_rank.get(s, 4))
+    wz_body = (wz_agent_body
+               + '<div class="ublist"><div class="ubrow"><span class="ub-n">Malware Sources</span><span class="ub-a">24h detections</span></div></div>'
+               + mw_body)
+    wz_combined_sub = wz_sub
+    if mw_sub:
+        wz_combined_sub += f" | malware: {mw_sub}"
+
+    row2 = (card("UNIFI UDM-SE", U.get("state", "error"), uni_body, uni_sub)
             + card("NGINX PROXY MGR", NPM.get("state", "error"), npm_body, npm_sub)
+            + card("CLOUDFLARE", CF.get("state", "error"), cf_body, cf_sub)
+            + card("WAZUH SIEM", wz_combined_state, wz_body, wz_combined_sub)
             + card("CROWDSEC", C.get("state", "error"), cs_body, cs_sub)
-            + card("WAZUH SIEM", W.get("state", "error"), wz_body, wz_sub)
-            + card("UNIFI UDM-SE", U.get("state", "error"), uni_body, uni_sub)
+            + card("LIMACHARLIE (LC)", LC.get("state", "error"), lc_body, lc_sub)
             + card("ADGUARD · DNS1", A.get("state", "error"), ag_body, ag_sub)
             + card("ADGUARD · DNS2", A2.get("state", "error"), ag2_body, ag2_sub)
             + card("TAILSCALE", TS.get("state", "error"), ts_body, ts_sub)
@@ -1772,6 +2235,10 @@ def render(data, gen_epoch, errors, trends=None):
     for s in P.get("storage", []):
         if s["pct"] > 85:
             alerts.append(f'Storage {s["name"]} at {s["pct"]:.0f}%')
+    for p in SM.get("problems", []):
+        alerts.append(f"SMART: {p}")
+    if WAN.get("state") in ("warn", "crit"):
+        alerts.append(f'WAN: {WAN.get("status","?")} latency={WAN.get("latency","n/a")}ms uptime={_fmt_duration(WAN.get("uptime"))}')
     if D.get("bad"):
         alerts += [f"Docker: {b}" for b in D["bad"][:5]]
     if B.get("fail"):
@@ -1784,6 +2251,10 @@ def render(data, gen_epoch, errors, trends=None):
         alerts.append(f"Monitor {st}: {k}")
     if W.get("down"):
         alerts += [f"Wazuh agent offline: {a}" for a in W["down"]]
+    if LC.get("offline_hosts"):
+        alerts += [f"LimaCharlie sensor offline: {a}" for a in LC["offline_hosts"]]
+    if LC.get("detections_24h"):
+        alerts.append(f'LimaCharlie: {LC["detections_24h"]} detection(s) in 24h')
     if U.get("wan") not in ("ok", "?"):
         alerts.append(f'UniFi WAN status: {U.get("wan")}')
     if U.get("ips_24h", 0):
@@ -1909,7 +2380,7 @@ PAGE = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="60">
-<title>Homelab Homelab NOC</title>
+<title>MRDTech Homelab NOC</title>
 <style>
   :root {{
     --bg:#0a0e0a; --panel:#0f150f; --panel2:#121a12; --line:#1c2a1c;
@@ -2067,7 +2538,7 @@ PAGE = """<!DOCTYPE html>
 <body>
   <div class="topbar">
     <div class="brand">
-      <h1>Homelab Homelab</h1><span class="tag">NOC // ANTON</span>
+      <h1>MRDTech Homelab</h1><span class="tag">NOC // ANTON</span>
     </div>
     <div class="top-right">
       <div class="ts">UPDATED <b>{ts}</b></div>
