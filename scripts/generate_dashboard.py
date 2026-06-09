@@ -31,13 +31,31 @@ def load_env(path):
     d = {}
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
-            m = re.match(r'^([A-Za-z_]\w*)=(.*)$', line.rstrip("\n"))
+            # Accept normal .env syntax plus the variants humans inevitably
+            # paste in: leading whitespace, optional "export", and spaces
+            # around '='. Last-wins for duplicate blocks / stale placeholders.
+            m = re.match(r'^\s*(?:export\s+)?([A-Za-z_]\w*)\s*=\s*(.*)$', line.rstrip("\n"))
             if m:
-                d[m.group(1)] = m.group(2)  # last-wins (dup blocks / stale placeholders)
+                d[m.group(1)] = m.group(2)
+    # Cron runs do not inherit Hermes' process environment, but manual runs can.
+    # Let real process env override file values without ever printing secrets.
+    d.update({k: v for k, v in os.environ.items() if k.startswith(("LIMACHARLIE_", "LIMA_CHARLIE_", "LC_"))})
     return d
 
 
 E = load_env(ENV_PATH)
+
+
+def _env_first(*keys):
+    """Return the first non-placeholder value from supported .env aliases."""
+    for key in keys:
+        val = E.get(key, "")
+        if val is None:
+            continue
+        val = str(val).strip().strip('"').strip("'")
+        if val and not val.startswith("<"):
+            return val
+    return ""
 
 def _service_base_url(host_or_url, scheme="https", port=None):
     """Normalize .env host fields that may be bare hosts or full URLs."""
@@ -75,6 +93,21 @@ def req(url, headers=None, data=None, method=None, cookiejar=None):
 
 def jget(url, headers=None, data=None, method=None, cookiejar=None):
     return json.loads(req(url, headers, data, method, cookiejar))
+
+
+def _docker_mux_decode(buf):
+    """Decode Docker exec multiplexed stdout/stderr frames."""
+    if isinstance(buf, str):
+        buf = buf.encode()
+    out = bytearray()
+    i = 0
+    while i + 8 <= len(buf) and buf[i] in (0, 1, 2):
+        size = int.from_bytes(buf[i+4:i+8], "big")
+        out.extend(buf[i+8:i+8+size])
+        i += 8 + size
+    if not out:
+        out.extend(buf)
+    return out.decode("utf-8", "replace")
 
 
 def _pmox_auth():
@@ -232,10 +265,13 @@ def collect_smart_health():
         d["state"] = "crit"
     elif d["warn"] or d["problems"]:
         d["state"] = "warn"
+    elif d["passed"] == d["checked"] and not d["problems"]:
+        # VM disks are virtual and their guest SMART is unobservable from
+        # Proxmox. That is informational; it must not turn a clean host disk
+        # result into a grey/degraded card.
+        d["state"] = "ok"
     if d["vm_disks"]:
         d["vm_note"] = f'{d["vm_disks"]} VM virtual disk(s); guest SMART not exposed by Proxmox'
-        if d["state"] == "ok":
-            d["state"] = "degraded"
     return d
 
 
@@ -356,6 +392,51 @@ def collect_uptime_kuma():
         d["certs"].append({"name": k, "days": int(days), "valid": valid})
     d["certs"].sort(key=lambda x: x["days"])
     d["status_map"] = status
+    if not status:
+        # Uptime Kuma 1.23 can return certificate metrics while omitting
+        # monitor_status/monitor_response_time entirely. Do not render 0/0 or
+        # fake-green. Fall back to the local Kuma SQLite monitor table via the
+        # already-configured Portainer Docker API, read-only, to at least show
+        # the active monitor inventory and make the missing status explicit.
+        try:
+            pbase = E.get("PORTAINER_URL", "").strip().rstrip("/")
+            puser = E.get("PORTAINER_USERNAME", "").strip()
+            ppw = E.get("PORTAINER_PASSWORD", "").strip()
+            if pbase and puser and ppw and not ppw.startswith("<"):
+                jwt = jget(f"{pbase}/api/auth", data={"Username": puser, "Password": ppw}, method="POST")["jwt"]
+                ph = {"Authorization": f"Bearer {jwt}"}
+                for ep in jget(f"{pbase}/api/endpoints", ph):
+                    epid = ep.get("Id")
+                    cs = jget(f"{pbase}/api/endpoints/{epid}/docker/containers/json?all=1", ph)
+                    cid = next((c.get("Id") for c in cs
+                                if "uptime-kuma" in "/".join(c.get("Names") or []).lower()
+                                or "uptime-kuma" in str(c.get("Image", "")).lower()), None)
+                    if not cid:
+                        continue
+                    cmd = ["sqlite3", "/app/data/kuma.db",
+                           "select name from monitor where active=1 order by name;"]
+                    ex = jget(f"{pbase}/api/endpoints/{epid}/docker/containers/{urllib.parse.quote(cid)}/exec",
+                              ph, {"AttachStdout": True, "AttachStderr": True, "Tty": True, "Cmd": cmd}, "POST")
+                    raw = req(f"{pbase}/api/endpoints/{epid}/docker/exec/{urllib.parse.quote(ex['Id'])}/start",
+                              ph, {"Detach": False, "Tty": True}, "POST")
+                    names = [re.sub(r"[^\x20-\x7e]", "", ln).strip()
+                             for ln in _docker_mux_decode(raw).splitlines()]
+                    names = [n for n in names if n]
+                    if names:
+                        d["active_monitors"] = names
+                        d["total"] = len(names)
+                        d["up"] = 0
+                        d["state"] = "degraded"
+                        d["status_unavailable"] = True
+                        d["note"] = "monitor_status missing from /metrics; active monitors counted from Kuma DB"
+                    break
+        except Exception as e:
+            d["state"] = "degraded"
+            d["note"] = f"monitor_status missing from /metrics; DB fallback failed: {type(e).__name__}"
+        if not d.get("status_unavailable") and not d.get("note"):
+            d["state"] = "degraded"
+            d["note"] = "monitor_status missing from /metrics"
+        return d
     if d["down"]:
         d["state"] = "crit"
     elif d["other"]:
@@ -1315,10 +1396,16 @@ def collect_limacharlie():
       - /v1/insight/{oid}/detections
     No tasking, isolation, tags, policy, or mutation endpoints. Anton approves.
     """
-    api_key = E.get("LIMACHARLIE_API_KEY", "").strip()
-    oid = E.get("LIMACHARLIE_OID", "").strip()
-    if not api_key or api_key.startswith("<") or not oid or oid.startswith("<"):
-        return {"state": "degraded", "note": "LimaCharlie creds not set",
+    api_key = _env_first("LIMACHARLIE_API_KEY", "LIMA_CHARLIE_API_KEY", "LC_API_KEY")
+    oid = _env_first("LIMACHARLIE_OID", "LIMACHARLIE_ORG_OID", "LIMACHARLIE_ORG_ID", "LIMACHARLIE_ORG", "LIMA_CHARLIE_OID", "LIMA_CHARLIE_ORG_OID", "LIMA_CHARLIE_ORG_ID", "LC_OID")
+    if not api_key or not oid:
+        present = [k for k in ("LIMACHARLIE_API_KEY", "LIMA_CHARLIE_API_KEY", "LC_API_KEY",
+                               "LIMACHARLIE_OID", "LIMACHARLIE_ORG_OID", "LIMACHARLIE_ORG_ID", "LIMACHARLIE_ORG",
+                               "LIMA_CHARLIE_OID", "LIMA_CHARLIE_ORG_OID", "LIMA_CHARLIE_ORG_ID", "LC_OID") if E.get(k)]
+        note = "LimaCharlie creds not set"
+        if present:
+            note = "LimaCharlie creds incomplete: " + ", ".join(present)
+        return {"state": "degraded", "note": note,
                 "total": 0, "online": 0, "offline": 0,
                 "detections_24h": None, "top": [], "offline_hosts": []}
 
@@ -1846,10 +1933,19 @@ def render(data, gen_epoch, errors, trends=None):
     if pbs_fail:
         pbs_sub = f'{pbs_fail} FAILED task(s) in 24h' + (f' · {pbs_sub}' if pbs_sub else '')
 
-    kuma_body = (metric("Monitors", f'{K.get("up",0)}/{K.get("total",0)} up',
-                       "crit" if K.get("down") else ("warn" if K.get("other") else "ok")))
-    kuma_sub = K.get("note") or K.get("error") or (
-        ("DOWN: " + ", ".join(K.get("down", []))) if K.get("down") else "all monitors up")
+    if K.get("status_unavailable"):
+        kuma_body = (metric("Monitors", f'{K.get("total",0)} active', "")
+                     + metric("Status", "n/a", "")
+                     + metric("Certs", len(K.get("certs", []))))
+    else:
+        kuma_body = (metric("Monitors", f'{K.get("up",0)}/{K.get("total",0)} up',
+                           "crit" if K.get("down") else ("warn" if K.get("other") else "ok")))
+    if K.get("status_unavailable"):
+        kuma_sub = K.get("note") or K.get("error") or "monitor status unavailable"
+    else:
+        kuma_sub = K.get("note") or K.get("error") or (
+            ("DOWN: " + ", ".join(K.get("down", []))) if K.get("down")
+            else ("all monitors up" if K.get("total", 0) else "no monitor status data"))
 
     smart_body = (metric("Host Disks", f'{SM.get("passed",0)}/{SM.get("checked",0)} pass',
                          "crit" if SM.get("fail") else ("warn" if SM.get("warn") else ("ok" if SM.get("checked") else "")))
