@@ -17,15 +17,47 @@ try:
 except Exception:
     pass
 
-ENV_PATH = os.path.expanduser("~/.hermes/.env")
-OUT_DIR = os.path.expanduser("~/mrdtech-dashboard")
-OUT_FILE = os.path.join(OUT_DIR, "index.html")
+ENV_PATH = os.environ.get("HERMES_ENV", os.path.expanduser("~/.hermes/.env"))
+OUT_DIR = os.environ.get("NOC_OUT_DIR", os.path.expanduser("~/mrdtech-dashboard"))
+OUT_FILE = os.environ.get("NOC_OUT_FILE", os.path.join(OUT_DIR, "index.html"))
 TIMEOUT = 15
 CERT_WARN_DAYS = 30
+DEFAULT_DASHBOARD_TITLE = "NOC Dashboard"
+DEFAULT_DASHBOARD_SUBTITLE = "Infrastructure Monitoring"
+STATE_DIR = os.environ.get("NOC_STATE_DIR", os.path.join(OUT_DIR, "state"))
+CONFIG_FILE = os.environ.get("NOC_CONFIG_FILE", os.path.join(STATE_DIR, "config.json"))
 CTX = ssl.create_default_context()
 CTX.check_hostname = False
 CTX.verify_mode = ssl.CERT_NONE
 
+
+def load_dashboard_config():
+    cfg = {
+        "dashboard_title": DEFAULT_DASHBOARD_TITLE,
+        "dashboard_subtitle": DEFAULT_DASHBOARD_SUBTITLE,
+        "logo_url": "",
+    }
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, dict):
+            for key in cfg:
+                val = raw.get(key)
+                if isinstance(val, str):
+                    cfg[key] = val.strip()
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"warn: dashboard config load failed: {type(e).__name__}: {str(e)[:80]}")
+    cfg["dashboard_title"] = cfg["dashboard_title"] or DEFAULT_DASHBOARD_TITLE
+    cfg["dashboard_subtitle"] = cfg["dashboard_subtitle"] or DEFAULT_DASHBOARD_SUBTITLE
+    return cfg
+
+def dashboard_logo_html(cfg):
+    logo = (cfg.get("logo_url") or "").strip()
+    if not logo:
+        return ""
+    return f'<img class="brand-logo" src="{esc(logo)}" alt="Dashboard logo">'
 
 def load_env(path):
     d = {}
@@ -2464,8 +2496,13 @@ def render(data, gen_epoch, errors, trends=None):
     else:
         hist_block = '<div class="empty">Collecting uptime history&hellip; bars populate after a few regen cycles.</div>'
 
+    dashboard_cfg = load_dashboard_config()
     return PAGE.format(
         ts=esc(ts), overall=overall, overall_txt=overall_txt,
+        doc_title=esc(dashboard_cfg["dashboard_title"]),
+        dashboard_title=esc(dashboard_cfg["dashboard_title"]),
+        dashboard_subtitle=esc(dashboard_cfg["dashboard_subtitle"]),
+        dashboard_logo=dashboard_logo_html(dashboard_cfg),
         row1=row1, row2=row2, media_row=media_row, row3=row3,
         qnap_cards=qnap_cards, kuma_history=hist_block,
         cert_tiles=cert_tiles, alert_block=alert_block)
@@ -2476,7 +2513,7 @@ PAGE = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="60">
-<title>MRDTech Homelab NOC</title>
+<title>{doc_title}</title>
 <link rel="icon" id="noc-favicon" type="image/svg+xml" href="">
 <style>
   :root {{
@@ -2491,7 +2528,9 @@ PAGE = """<!DOCTYPE html>
   .topbar {{ display:flex; align-items:center; justify-content:space-between;
     padding:14px 22px; border-bottom:1px solid var(--line);
     background:linear-gradient(180deg,#0c130c,#080b08); position:sticky; top:0; z-index:5; }}
-  .brand {{ display:flex; align-items:baseline; gap:14px; }}
+  .brand {{ display:flex; align-items:center; gap:14px; }}
+  .brand-text {{ display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; }}
+  .brand-logo {{ width:30px; height:30px; object-fit:contain; border-radius:4px; flex:none; }}
   .brand h1 {{ font-size:20px; margin:0; color:var(--green); letter-spacing:2px;
     text-shadow:0 0 8px rgba(0,255,65,.4); }}
   .brand .tag {{ color:var(--muted); font-size:11px; letter-spacing:3px; }}
@@ -2681,7 +2720,7 @@ PAGE = """<!DOCTYPE html>
 <body>
   <div class="topbar">
     <div class="brand">
-      <h1>MRDTech Homelab</h1><span class="tag">NOC // ANTON</span>
+      {dashboard_logo}<div class="brand-text"><h1>{dashboard_title}</h1><span class="tag">{dashboard_subtitle}</span></div>
     </div>
     <div class="top-right">
       <div class="ts">UPDATED <b>{ts}</b></div>
