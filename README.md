@@ -1,5 +1,8 @@
 # 🖥️ Homelab Monitoring & Automation Stack
 
+> ⚠️ This project has been superseded by NOC Dashboard. This repository is archived and read-only.
+
+
 > A complete, self-hosted NOC (Network Operations Center) for a Proxmox homelab —
 > agentic automation, a zero-dependency live dashboard, SIEM hardening, and 18
 > scheduled monitors that push to Telegram and Gotify. Built to run unattended.
