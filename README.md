@@ -1,193 +1,457 @@
-# 🖥️ Homelab Monitoring & Automation Stack
+# Hermes Agent Setup for MRDTech
 
-> ⚠️ This project has been superseded by NOC Dashboard. This repository is archived and read-only.
+This repository documents the MRDTech Hermes Agent control node: how it is installed, configured, secured, operated, and extended for homelab infrastructure automation.
 
+Hermes runs on the dedicated Hermes VM and acts as the operational agent for MRDTech. It manages monitoring scripts, scheduled jobs, GitHub workflows, Portainer deployments, Wazuh checks, CrowdSec reporting, Proxmox/PBS visibility, NOC dashboard generation, and day-to-day infrastructure automation.
 
-> A complete, self-hosted NOC (Network Operations Center) for a Proxmox homelab —
-> agentic automation, a zero-dependency live dashboard, SIEM hardening, and 18
-> scheduled monitors that push to Telegram and Gotify. Built to run unattended.
+This is not a generic chatbot setup. It is the control plane. Treat it accordingly.
 
-![python](https://img.shields.io/badge/python-3.8%2B-blue)
-![dependencies](https://img.shields.io/badge/runtime%20deps-zero-brightgreen)
-![license](https://img.shields.io/badge/license-MIT-green)
-![status](https://img.shields.io/badge/status-production-success)
+## Current MRDTech layout
 
----
+| Component | Value |
+|---|---|
+| Hermes VM | VM 108 |
+| Hermes host | `10.10.10.234` |
+| Owner | Michael Dziegiel / MRDTech |
+| Primary config path | `~/.hermes/config.yaml` |
+| Secret env path | `~/.hermes/.env` |
+| Scripts path | `~/.hermes/scripts/` |
+| Skills path | `~/.hermes/skills/` |
+| Logs path | `~/.hermes/logs/` |
+| Session database | `~/.hermes/state.db` |
 
-## ⭐ The NOC Dashboard (hero feature)
+Core infrastructure Hermes knows how to operate:
 
-A **single Python file with zero runtime dependencies** polls every service in the
-lab and renders a self-contained, dark-themed HTML operations dashboard — no
-framework, no database, no build step. A cron job regenerates it every 15 minutes;
-any web server serves the static file.
+- Proxmox node and PBS
+- Docker/Portainer hosts
+- Wazuh SIEM
+- CrowdSec
+- AdGuard Home and Unbound
+- UniFi UDM-SE
+- Uptime Kuma
+- URBackup
+- NOC dashboards
+- GitHub repositories under `mdziegiel`
 
-![NOC Dashboard](docs/noc-dashboard.png)
+## Repository contents
 
-*Live dashboard — dark terminal aesthetic, section management, edit mode, 40+ integrations*
-
+```text
+.
+├── README.md                         # This setup and operations guide
+├── .env.template                     # Sanitized environment-variable template
+├── scripts/                          # Monitoring, reporting, dashboard, and watchdog scripts
+├── dashboard/                        # Static NOC dashboard service notes
+├── docs/                             # Architecture and setup notes
+└── wazuh/                            # Wazuh rules, active-response scripts, and agent notes
 ```
-┌─ PROXMOX ──────┐ ┌─ DOCKER ───────┐ ┌─ PBS ──────────┐ ┌─ WAZUH SIEM ───┐
-│ 9/10 VMs up    │ │ 42 running     │ │ 4 stores OK    │ │ 5/5 agents     │
-│ CPU 18% RAM 61%│ │ 0 unhealthy    │ │ last bkp ✓     │ │ alerts 8,646   │
-└────────────────┘ └────────────────┘ └────────────────┘ └────────────────┘
-┌─ CROWDSEC ─────┐ ┌─ ADGUARD DNS1 ─┐ ┌─ ADGUARD DNS2 ─┐ ┌─ UNIFI ────────┐
-│ 1,204 bans     │ │ 2.2M blocked   │ │ 1.8M blocked   │ │ WAN OK · 53 cl │
-│ ▁▂▃▅▇ trend    │ │ ▁▃▅▆▇ trend    │ │ ▁▃▅▆▇ trend    │ │ IPS 0 · 1Gbps  │
-└────────────────┘ └────────────────┘ └────────────────┘ └────────────────┘
-```
 
-Each service is an isolated, fault-tolerant collector — one API being down
-degrades only its card, never the page. Trend sparklines are inline SVG built
-from a rolling daily snapshot. **[Full dashboard docs →](dashboard/README.md)**
+The scripts are designed to be copied or synchronized into `~/.hermes/scripts/` and run by Hermes cron jobs or manually during incident response.
 
----
+## Install Hermes Agent
 
-## What is this?
-
-This repo is the automation and monitoring layer that sits on top of a Proxmox
-homelab. It has four parts:
-
-1. **🤖 Agentic control node (Hermes)** — an AI agent running on a dedicated VM
-   that manages the lab: runs the cron scripts, queries every API, drives SSH
-   deployments, and answers operational questions. The Python scripts here are
-   what it schedules and executes.
-2. **📊 NOC dashboard** — the zero-dependency live status page above.
-3. **🛡️ Security hardening** — Wazuh SIEM active-response, a low-noise Sysmon
-   detection ruleset, brute-force auto-blocking, and DNS-aware alert delivery.
-4. **🔔 18 scheduled monitors** — backup verification, VM/disk/container health,
-   threat digests, cert expiry, new-device detection, and alerting heartbeats.
-
-Everything is **stdlib-only Python** (the control node has no `pip`), reads all
-hosts and credentials from a single `.env`, and delivers alerts to **Telegram**
-(primary) and **Gotify** (out-of-band fallback).
-
----
-
-## 🧱 The Monitoring Stack
-
-| Layer | Tool | Role |
-|-------|------|------|
-| **SIEM** | **Wazuh** | endpoint monitoring, log aggregation, Sysmon detections, active response |
-| **Behavioral IPS** | **CrowdSec** | crowd-sourced detection + automated banning (firewall/Cloudflare/nginx bouncers) |
-| **DNS filtering** | **AdGuard Home** | ad/tracker/malware blocking, two redundant instances |
-| **Recursive DNS** | **Unbound** | DNSSEC-validating resolver behind AdGuard |
-| **Network/IPS** | **UniFi (UDM-SE)** | routing, firewall, IDS/IPS, per-SSID client telemetry |
-| **Edge** | **Cloudflare** | DNS, WAF, Zero Trust tunnels |
-| **Remote access** | **Tailscale** | mesh VPN, MagicDNS, key-expiry monitoring |
-| **Uptime** | **Uptime Kuma** | per-service up/down + TLS cert-days tracking |
-| **Backups** | **Proxmox Backup Server + URBackup** | VM + endpoint backup, verification reporting |
-| **Notifications** | **Telegram + Gotify** | primary + out-of-band alert channels |
-
----
-
-## ⏰ Cron Schedule (18 jobs)
-
-All jobs run script-only (no LLM), silent unless there's something to report.
-
-| Job | Schedule | Script | Purpose |
-|-----|----------|--------|---------|
-| Docker Watchdog | every 15 min | `alert_docker_watchdog.py` | container drop alerts (Portainer) |
-| Dashboard Regenerate | every 15 min | `generate_dashboard.py` | rebuild NOC dashboard HTML |
-| New Device Alert | hourly | `alert_new_device.py` | first-seen MAC on the network (UniFi) |
-| VM Health Check | every 2 h | `alert_vm_health.py` | running VM dropped / recovered (Proxmox) |
-| Docker Health | every 2 h | `docker_watchdog.py` | Portainer container health sweep |
-| Disk Space Alert | every 6 h | `alert_disk_space.py` | Proxmox storage > 85% |
-| Wazuh Alert Digest | daily 20:00 | `report_wazuh_alerts.py` | high/critical SIEM alerts (24h) |
-| CrowdSec Digest | daily 20:00 | `report_crowdsec.py` | new detections, bans, bouncer status |
-| AdGuard Stats | daily 20:00 | `report_adguard.py` | query count, block rate, top domains |
-| UniFi Threat Digest | daily 20:00 | `report_unifi_threats.py` | IDS/IPS detections, WAN status |
-| Uptime Kuma Digest | daily 20:00 | `report_uptime_kuma.py` | monitor up/down + TLS cert days |
-| PBS Backup Verify | daily 08:00 | `report_pbs_backups.py` | last-24h backup/verify results |
-| URBackup Report | daily 08:00 | `report_urbackup.py` | client backup freshness |
-| Cert Expiry Alert | daily 08:30 | `alert_cert_expiry.py` | TLS certs below threshold |
-| Tailscale Key Expiry | daily 09:00 | `alert_tailscale_key_expiry.py` | API key nearing expiry |
-| Telegram Heartbeat | weekly Mon 09:00 | `telegram_heartbeat.py` | verifies alert delivery path still works |
-| Morning Briefing | weekly Sat 11:00 | `morning_briefing.py` | full infra summary |
-| Weekly Infra Report | weekly Sat 12:00 | `report_weekly.py` | backup success rate, uptime, trends |
-
----
-
-## 🚀 Quick Start
+Run this on the Hermes VM as `michaeld`:
 
 ```bash
-# 1. Clone
-git clone https://github.com/YOUR_GITHUB_USER/homelab-monitoring.git
-cd homelab-monitoring
+curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+```
 
-# 2. Configure — copy the template and fill in YOUR hosts + credentials
+Start the CLI:
+
+```bash
+hermes
+```
+
+Run the setup wizard if the install is new:
+
+```bash
+hermes setup
+```
+
+Health-check the installation:
+
+```bash
+hermes doctor
+hermes status --all
+```
+
+## Configure model and provider
+
+Use the interactive picker:
+
+```bash
+hermes model
+```
+
+Or set values directly:
+
+```bash
+hermes config set model.provider openai-api
+hermes config set model.default gpt-5.5
+```
+
+Exact provider names and model names depend on the active Hermes build and configured credentials. Do not commit provider API keys. They belong in `~/.hermes/.env` or Hermes auth storage.
+
+## Configure secrets
+
+Copy the template and lock permissions:
+
+```bash
+mkdir -p ~/.hermes
 cp .env.template ~/.hermes/.env
 chmod 600 ~/.hermes/.env
 $EDITOR ~/.hermes/.env
+```
 
-# 3. Install the scripts
+The `.env` file is the source for infrastructure credentials used by scripts and tools. It should contain values for services such as:
+
+- `PROXMOX_URL`, `PROXMOX_TOKEN_ID`, `PROXMOX_TOKEN_SECRET`
+- `PBS_PASSWORD`
+- `WAZUH_URL`, `WAZUH_USERNAME`, `WAZUH_PASSWORD`
+- `CROWDSEC_API_KEY`, `CROWDSEC_MACHINE_PASS`
+- `UNIFI_PASSWORD`
+- `ADGUARD_PASSWORD`
+- `UPTIME_KUMA_URL`, `UPTIME_KUMA_API_KEY`
+- `URBACKUP_URL`, `URBACKUP_USERNAME`, `URBACKUP_PASSWORD`
+- `PORTAINER_URL`, `PORTAINER_USERNAME`, `PORTAINER_PASSWORD`
+- Telegram/Gotify notification credentials if alerting is enabled
+
+Never print secrets into chat, logs, commits, tickets, or README examples. Satan already has enough plaintext credentials.
+
+## Core Hermes configuration
+
+View config:
+
+```bash
+hermes config
+```
+
+Edit config:
+
+```bash
+hermes config edit
+```
+
+Useful settings:
+
+```bash
+hermes config set memory.memory_enabled true
+hermes config set memory.user_profile_enabled true
+hermes config set security.redact_secrets true
+hermes config set approvals.mode manual
+hermes config set agent.max_turns 90
+```
+
+Use `manual` approvals for normal operations. Use `smart` only if you trust the environment. Use `off` only when you deliberately want the guardrails removed and are prepared to own the crater.
+
+## Toolsets
+
+Inspect enabled toolsets:
+
+```bash
+hermes tools list
+```
+
+Interactive tool configuration:
+
+```bash
+hermes tools
+```
+
+Typical MRDTech control-node toolsets:
+
+- terminal
+- file
+- web/search
+- browser when needed
+- skills
+- memory
+- session_search
+- cronjob
+- delegation
+- messaging if gateway delivery is configured
+- homeassistant if smart-home control is required
+
+Tool changes take effect on a new Hermes session.
+
+## Skills
+
+List skills:
+
+```bash
+hermes skills list
+```
+
+Install or update skills:
+
+```bash
+hermes skills browse
+hermes skills install <skill-id>
+hermes skills check
+hermes skills update
+```
+
+MRDTech-specific operational skills should live under `~/.hermes/skills/` and document workflows that are too specific or too easy to forget, such as:
+
+- Portainer stack management
+- MRDTech infrastructure monitoring
+- CrowdSec/NPM log ingestion
+- SSH key bootstrap and rotation
+- YAML-configurable dashboard deployment
+- Home Assistant operations
+- GitHub workflows
+
+Good skills include triggers, exact commands, pitfalls, and verification steps. Bad skills are vibes with YAML frontmatter.
+
+## Scripts installation
+
+Install scripts into Hermes:
+
+```bash
 mkdir -p ~/.hermes/scripts
-cp scripts/*.py ~/.hermes/scripts/
+rsync -av scripts/ ~/.hermes/scripts/
+chmod +x ~/.hermes/scripts/*.py
+```
 
-# 4. Generate the dashboard once to verify connectivity
+Run a script manually:
+
+```bash
+python3 ~/.hermes/scripts/report_uptime_kuma.py
+python3 ~/.hermes/scripts/report_wazuh_alerts.py
 python3 ~/.hermes/scripts/generate_dashboard.py
-#  → ~/homelab-dashboard/index.html
-
-# 5. Serve it (keep it behind VPN/Tailscale — never public)
-cd ~/homelab-dashboard && python3 -m http.server 8080
-
-# 6. Schedule the monitors (cron or systemd timers — see docs/setup.md)
 ```
 
-See **[docs/setup.md](docs/setup.md)** for the full from-scratch build and
-**[wazuh/README.md](wazuh/README.md)** to apply the SIEM hardening.
+Scripts should be quiet when there is nothing to report. Cron jobs should not spam. Alert fatigue is how monitoring becomes wallpaper.
 
----
+## Cron jobs
 
-## 🗺️ Architecture
+List jobs:
 
-A Proxmox node hosts ~12 purpose-built VMs (control node, Docker, SIEM, DNS,
-backup, etc.). The control node polls everything over the LAN and pushes alerts
-out. Full VM layout and service map: **[docs/architecture.md](docs/architecture.md)**.
-
-```
-Internet ─▶ Cloudflare ─▶ UniFi UDM ─▶ ┌─────────────── Proxmox node ───────────────┐
-                                       │ control-node  docker  wazuh  dns  backup …  │
-                                       └──────────────────────────────────────────────┘
-                            Tailscale mesh overlays the whole LAN for remote access
+```bash
+hermes cron list
 ```
 
----
+Create script-only watchdog jobs:
 
-## 🔐 Security & Sanitization
-
-- **No secrets in this repo.** All credentials and hosts come from `.env`
-  (gitignored). Every IP here is a sanitized RFC1918 placeholder (`10.0.0.0/24`).
-- Copy `.env.template` → `.env` and fill in real values. `.env` is gitignored.
-- The dashboard and scripts never write secrets into output — only aggregate
-  metrics.
-- **Do not expose the dashboard or any service API to the public internet.**
-  Keep them behind Tailscale / VPN.
-
-## 📂 Repo layout
-
-```
-.
-├── README.md                 ← you are here
-├── .env.template             ← all required env vars (YOUR_X_HERE placeholders)
-├── .gitignore
-├── scripts/                  ← 19 stdlib-only monitoring/automation scripts
-│   ├── generate_dashboard.py ← the NOC dashboard generator (hero)
-│   ├── notify.py             ← shared Telegram+Gotify delivery helper
-│   └── …
-├── dashboard/
-│   ├── README.md             ← dashboard architecture, APIs, deployment
-│   └── homelab-dashboard.service
-├── wazuh/
-│   ├── README.md             ← how to apply the SIEM hardening
-│   ├── ossec.conf.additions.xml
-│   ├── local_rules.xml       ← rule 100100 + Sysmon detections 100300–100322
-│   ├── custom-telegram.py
-│   └── …
-└── docs/
-    ├── architecture.md       ← VM layout + service map
-    └── setup.md              ← from-scratch replication guide
+```bash
+hermes cron create 'every 15m' \
+  --name docker-watchdog \
+  --script alert_docker_watchdog.py \
+  --no-agent
 ```
 
-## 📜 License
+Create LLM-assisted report jobs only when summarization or reasoning is actually useful:
 
-MIT — see [LICENSE](LICENSE). Provided as-is; adapt to your own environment.
+```bash
+hermes cron create '0 8 * * *' \
+  --name morning-infra-briefing \
+  --prompt 'Generate a concise MRDTech infrastructure briefing from current monitoring data.'
+```
+
+Use script-only jobs for threshold alerts, heartbeat checks, and deterministic reports. Use agent jobs for summarization, correlation, and triage.
+
+## Gateway setup
+
+Configure messaging platforms:
+
+```bash
+hermes gateway setup
+```
+
+Install gateway as a user service:
+
+```bash
+printf 'y\ny\n' | hermes gateway install --force
+```
+
+Verify:
+
+```bash
+hermes gateway status
+systemctl --user is-active hermes-gateway
+journalctl --user -u hermes-gateway -n 50 --no-pager
+```
+
+Restart after config changes:
+
+```bash
+hermes gateway restart
+```
+
+Gateway platform blocks in `config.yaml` are not enough. A platform is not enabled until it has valid credentials or pairing configured.
+
+## GitHub setup
+
+Set git identity:
+
+```bash
+git config --global user.name "Michael Dziegiel"
+git config --global user.email "mdziegiel74@yahoo.com"
+```
+
+Verify GitHub CLI or SSH access:
+
+```bash
+gh auth status || true
+ssh -T git@github.com
+```
+
+Common MRDTech pattern:
+
+```bash
+cd /home/michaeld/github/<repo>
+git status --short --branch
+python3 -m unittest discover -s tests -v || true
+git add -A
+git commit -m "type: concise message"
+git push
+```
+
+SSH can push to existing repositories. Repository creation may require GitHub web/API credentials.
+
+## Portainer deployment pattern
+
+Use the Portainer API rather than random SSH rituals when Portainer is the available control path.
+
+Discovery:
+
+```bash
+# Authenticate against the correct Portainer instance, then:
+GET /api/endpoints
+GET /api/stacks
+```
+
+For local-image app deployments:
+
+1. Build a tar context from the project root.
+2. Send it to Portainer Docker API proxy:
+   `POST /api/endpoints/<endpoint_id>/docker/build?t=<image>:<tag>&rm=1`
+3. Stop/remove the previous container with the same name.
+4. Recreate it with preserved or explicit configuration:
+   - published port
+   - restart policy
+   - named data volumes
+   - read-only host binds
+   - required environment variables
+   - healthcheck
+5. Start and poll container state until running/healthy.
+6. Verify the app over the host IP and published port.
+
+For backup-verification workloads, backup mounts must be read-only:
+
+```text
+/mnt/qnap-backups/urbackup:/mnt/qnap-backups/urbackup:ro
+```
+
+A container that can write to backup storage is not a verifier. It is a liability with a web UI.
+
+## NOC dashboard
+
+Generate manually:
+
+```bash
+python3 ~/.hermes/scripts/generate_dashboard.py
+```
+
+The dashboard is static HTML generated from live service collectors. One failed collector should degrade one card, not the entire page.
+
+See:
+
+- `dashboard/README.md`
+- `docs/architecture.md`
+- `docs/setup.md`
+
+## Wazuh integration
+
+Wazuh files in this repo include:
+
+- `wazuh/ossec.conf.additions.xml`
+- `wazuh/local_rules.xml`
+- `wazuh/custom-telegram.py`
+- `wazuh/windows-agent-sysmon.xml`
+
+Apply Wazuh changes surgically. Validate XML before restart. Restarting Wazuh blindly is how logs become archaeology.
+
+Suggested checks:
+
+```bash
+xmllint --noout wazuh/local_rules.xml
+xmllint --noout wazuh/ossec.conf.additions.xml
+```
+
+Deployment to Wazuh manager requires appropriate host access and privilege. Do not bypass access controls from Hermes.
+
+## Backup verification operations
+
+Backup verification should prove backup data can be read, not merely that a backup service is reachable.
+
+Expected checks:
+
+- API metadata where available
+- independent backup-directory discovery
+- newest backup selection
+- critical path presence
+- random file readability
+- checksum manifest validation when present
+- image metadata/readability checks when tools are available
+- stable JSON output for dashboards/NOC ingestion
+
+Backups must be mounted read-only. Verification history should persist in a data volume.
+
+## Security rules
+
+- Secrets live in `~/.hermes/.env`, not Git.
+- Keep `security.redact_secrets` enabled.
+- Prefer read-only mounts for monitoring and verification.
+- Do not expose dashboards, APIs, or agent gateways directly to the public internet.
+- Use Tailscale/VPN/Cloudflare Zero Trust where remote access is needed.
+- Verify every deployment with real app-layer checks.
+- If credentials are missing or invalid, stop and report that. Do not hallucinate success. Nietzsche would consider that beneath even humans.
+
+## Routine verification checklist
+
+After setup or major changes:
+
+```bash
+hermes doctor
+hermes status --all
+hermes tools list
+hermes skills list
+hermes cron list
+hermes gateway status
+python3 ~/.hermes/scripts/generate_dashboard.py
+```
+
+For repository updates:
+
+```bash
+git status --short --branch
+git log --oneline -5
+git remote -v
+```
+
+For deployed apps:
+
+```bash
+curl -fsS http://<host>:<port>/api/health
+```
+
+Also verify container state through Portainer or Docker. HTTP health alone can lie. Containers also lie. Cross-check both.
+
+## Recovery notes
+
+If Hermes behaves strangely:
+
+```bash
+hermes doctor --fix
+hermes config check
+hermes gateway restart
+journalctl --user -u hermes-gateway -n 100 --no-pager
+```
+
+If a tool or skill change does not appear, start a new Hermes session. Tool and skill context is cached for prompt stability.
+
+If a cron job is noisy, fix the script output. Empty stdout should mean silence for script-only watchdogs.
+
+## License
+
+MIT. Use it correctly or don't use it.
